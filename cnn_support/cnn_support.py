@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-08-03
+#REM 2022-08-10
 
 """
 Contains functions to help with setting up and visualizing training data with the BFGN package
@@ -8,6 +8,7 @@ Contains functions to help with setting up and visualizing training data with th
 
 import os
 import subprocess
+import ast
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LightSource
@@ -16,6 +17,27 @@ import gdal
 import fiona
 import rasterio
 from sklearn.metrics import classification_report
+
+
+def input_files_from_config(config_file, print_files=True):
+    """
+    Return a dictionary containing the lists of feature, response, and boundary
+    files specified in <config_file>. Dictionary keys are 'feature_files',
+    'response_files', and 'boundary_files'
+    """
+
+    filedict = {}
+    with open(config_file, 'r') as f:
+        for line in f:
+            for kind in ['feature_files:', 'response_files:', 'boundary_files:']:
+                if kind in line:
+                    line = line.replace(kind, '').strip()
+                    files = ast.literal_eval(line)
+                    filedict[kind] = files
+                    if print_files:
+                        print(f'{kind} {files}')
+
+    return filedict['feature_files:'], filedict['response_files:'], filedict['boundary_files:']
 
 
 def rasterize(reference_raster, shapefile_list, replace_existing):
@@ -33,7 +55,7 @@ def rasterize(reference_raster, shapefile_list, replace_existing):
             if os.path.isfile(file.replace('shp', 'tif')):
                 print(f"{file.replace('shp', 'tif')} already exists, not recreating")
                 continue
-        print(f'Rasterizing {file}')
+        print(f'Rasterizing {file} using {reference_raster} as reference')
         cmd_str = 'gdal_rasterize ' + file + ' ' + os.path.splitext(file)[0] +\
                 '.tif -init 0 -burn 1 -te ' + str(trans[0]) + ' ' + str(trans[3] +\
                 trans[5]*feature_set.RasterYSize) + ' ' + str(trans[0] +\
@@ -55,9 +77,9 @@ def boundary_shp_to_mask(boundary_file, background_file):
     geo = [geo[1], geo[2], geo[0], geo[4], geo[5], geo[3]]
     background = data.ReadAsArray()
     mask = np.full(background.shape, np.nan)
-    for idx, polygon in enumerate(boundary_ds):
+    for _, polygon in enumerate(boundary_ds):
         rasterio.features.rasterize([polygon['geometry']], transform=geo,\
-                                    default_value=idx, out=mask)
+                                    default_value=0, out=mask)
     return mask
 
 
@@ -95,8 +117,6 @@ def show_input_data(feature_file, response_file, boundary_file, hillshade=True):
     mask = boundary_shp_to_mask(boundary_file, feature_file)
 
     # show where the labelled features are, within the training boundaries
-    #canvas = np.zeros(mask.shape)
-    #canvas[mask == 0] = np.nan # set area outside training area boundary to NaN
     responses = gdal.Open(response_file, gdal.GA_ReadOnly).ReadAsArray()
     mask[responses != 0] = responses[responses != 0] # put the buildings on the canvas
     ax2.imshow(mask)
@@ -193,9 +213,16 @@ def show_applied_model(applied_model, original_img, zoom, responses=None, hillsh
 
     _, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 16))
 
+    if responses is not None:
+        shape = gdal.Open(responses, gdal.GA_ReadOnly)
+        shape = shape.ReadAsArray()
+        shape = np.ma.masked_where(shape < 1.0, shape)
+
     #Show the applied model probabilities for class 1 over the whole area to which it
     #has been applied
     ax1.imshow(applied_model[0], cmap='Greys_r')
+    if responses is not None:
+        ax1.imshow(shape, alpha=0.5, cmap='Reds_r')
 
     #Zoom into the applied model probabilities
     ax2.imshow(applied_model[0][zoom[0]:zoom[1], zoom[2]:zoom[3]], cmap='Greys_r')
@@ -205,10 +232,7 @@ def show_applied_model(applied_model, original_img, zoom, responses=None, hillsh
     ax3.imshow(classes[zoom[0]:zoom[1], zoom[2]:zoom[3]], cmap='Greys')
     #Overplot responses (buildings), if available
     if responses is not None:
-        shape = gdal.Open(responses, gdal.GA_ReadOnly)
-        shape = shape.ReadAsArray()[zoom[0]:zoom[1], zoom[2]:zoom[3]]
-        shape = np.ma.masked_where(shape < 1.0, shape)
-        ax3.imshow(shape, alpha=0.8, cmap='viridis_r')
+        ax3.imshow(shape[zoom[0]:zoom[1], zoom[2]:zoom[3]], alpha=0.8, cmap='viridis_r')
 
     #The original image for which everything was predicted (same subset/zoom region)
     original = tif_to_array(original_img)
@@ -247,7 +271,10 @@ def performance_metrics(applied_model, responses, boundary_file):
     expected = list(expected[~(np.isnan(expected))])
 
     # get performance metrics
-    print(classification_report(expected, predicted))
+    print('Calculating metrics...')
+    stats = classification_report(expected, predicted, output_dict=True)
+
+    return stats
 
 
 if __name__ == "__main__":
