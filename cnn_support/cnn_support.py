@@ -1,14 +1,17 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-08-10
+#REM 2022-08-11
 
 """
 Contains functions to help with setting up and visualizing training data with the BFGN package
 """
 
 import os
+import shutil
 import subprocess
+import warnings
 import ast
+from IPython.utils import io
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LightSource
@@ -17,6 +20,21 @@ import gdal
 import fiona
 import rasterio
 from sklearn.metrics import classification_report
+
+#suppress warnings that arise as an old version of tf is imported by bfgn
+warnings.filterwarnings("ignore", message=r"Passing", category=FutureWarning)
+import bfgn.reporting.reports
+from bfgn.configuration import configs
+from bfgn.data_management import data_core, apply_model_to_data
+from bfgn.experiments import experiments
+
+#suppress tf 'Your CPU supports instructions...' message and some deprecation-type warnings
+import tensorflow as tf
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+tf.logging.set_verbosity(tf.logging.ERROR)
+
+#Suppress warnings raised when lots of plots are opened
+warnings.filterwarnings("ignore", message=r"Passing", category=RuntimeWarning)
 
 
 def input_files_from_config(config_file, print_files=True):
@@ -203,7 +221,8 @@ def tif_to_array(tif):
     return arr
 
 
-def show_applied_model(applied_model, original_img, zoom, responses=None, hillshade=True):
+def show_applied_model(applied_model, original_img, zoom, responses=None, hillshade=True,\
+                      filename=None):
     """
     Plots the applied model created by bfgn.data_management.apply_model_to_data.apply_model_to_site,
     converted to a numpy array by self.applied_model_as_array. Also zooms into a subregion and
@@ -246,6 +265,9 @@ def show_applied_model(applied_model, original_img, zoom, responses=None, hillsh
 
     plt.tight_layout()
 
+    if filename is not None:
+        plt.savefig(filename, dpi=400)
+
 
 def performance_metrics(applied_model, responses, boundary_file):
     """
@@ -275,6 +297,149 @@ def performance_metrics(applied_model, responses, boundary_file):
     stats = classification_report(expected, predicted, output_dict=True)
 
     return stats
+
+
+def loop_over_configs(parameter_combos, permutations, application_feature_files,\
+                      application_response_files, application_boundary_files,\
+                      application_output_basenames, outpath, zooms):
+    """
+    """
+
+    #Array to hold the performance metrics
+    stats_array = np.zeros((len(parameter_combos), len(application_feature_files)*3))
+
+    #Loop over the parameter combos, fit model  record metrics
+    for idx, params in enumerate(parameter_combos):
+
+        #get the current set of parameters
+        combo_dict = {}
+        for i, j in enumerate(params):
+            name = list(permutations.keys())[i]
+            combo_dict[name] = j
+
+        print('\n===================================================')
+        print(f'Testing parameter combination #{idx}: {combo_dict}\n')
+
+        #create a new settings file with these parameters
+        #(could probably find a way of not re-opening the settings file every time)
+        newlines = []
+        with open('settings.yaml', 'r') as f:
+            for line in f:
+                #identify and edit lines containing parameters to be changed
+                if any(ele in line for ele in permutations.keys()):
+                    item = line.split(':')[0].strip()
+                    try:
+                        newline = f'  {item}: {combo_dict[item]}\n'
+                        newlines.append(newline)
+                    except KeyError as err:
+                        #this probably means there is something wrong with the input permutations
+                        print(f'WARNING: not changing parameter {err} \n')
+                        newlines.append(line)
+                else:
+                    newlines.append(line)
+
+        with open(f'new_settings_{idx}.yaml', 'w') as f:
+            for line in newlines:
+                f.write(line)
+
+        #delete existing munged data and model output
+        shutil.rmtree('./data_out', ignore_errors=True)
+        shutil.rmtree('./model_out', ignore_errors=True)
+        #create output dir for this specific parameter combo
+        os.makedirs(f'combo_{idx}', exist_ok=True)
+
+        #fit the model using this parameter combo, suppressing very verbose output
+        with io.capture_output():
+            config = configs.create_config_from_file(f'new_settings_{idx}.yaml')
+            data_container = data_core.DataContainer(config)
+            data_container.build_or_load_rawfile_data(rebuild=True)
+            data_container.build_or_load_scalers()
+            data_container.load_sequences()
+            experiment = experiments.Experiment(config)
+            experiment.build_or_load_model(data_container=data_container)
+            experiment.fit_model_with_data_container(data_container, resume_training=True)
+            final_report = bfgn.reporting.reports.Reporter(data_container, experiment, config)
+            final_report.create_model_report()
+
+        #for each test region, apply the model and get stats
+        for i, _f in enumerate(application_feature_files):
+            #apply the model
+            bfgn.data_management.apply_model_to_data.apply_model_to_site(experiment.model,
+                                                                    data_container,
+                                                                    _f,
+                                                                    application_output_basenames[i])
+            #convert tif to array
+            applied_model = tif_to_array(application_output_basenames[i]+'.tif')
+            #archive the applied model tif
+            shutil.move(f'{application_output_basenames[i]}.tif',\
+                        f"combo_{idx}/{application_output_basenames[i].replace(outpath, '')}.tif")
+            #make pdf showing applied model
+            show_applied_model(applied_model, zoom=zooms[i], original_img=_f[0],\
+                               responses=application_response_files[i], filename=\
+                               f"combo_{idx}/{application_output_basenames[i].replace(outpath, '')}\
+                               .pdf")
+            #get performance metrics
+            stats = performance_metrics(applied_model, application_response_files[i],\
+                                                    application_boundary_files[i])
+
+            #stats for class 1 (building)
+            stats_array[idx, i*3] = np.round(stats['1.0']['precision'], 2)
+            stats_array[idx, i*3+1] = np.round(stats['1.0']['recall'], 2)
+            stats_array[idx, i*3+2] = np.round(stats['1.0']['f1-score'], 2)
+
+        n_samples = np.sum([len(n) for n in data_container.features])
+        print(f'\n{n_samples} training samples were extracted from the data\n')
+
+        #archive the model report and settings file
+        shutil.move('./model_out/model_report.pdf' , f'combo_{idx}/model_report.pdf')
+        shutil.move(f'new_settings_{idx}.yaml' , f'combo_{idx}/new_settings_{idx}.yaml')
+
+        #close all figures in the hope of not creating memory problems by having too many
+        plt.close('all')
+
+    return stats_array
+                               
+                               
+def parameter_heatmap(stats_array, permutations, application_output_basenames, parameter_combos, nicknames=None):
+    """
+    """
+                               
+    print(f'Parameters tested:{[k for k in permutations.keys()]}')
+
+    _, ax = plt.subplots(figsize=(10, 10))
+    im = ax.imshow(stats_array, vmin=0, vmax=1, cmap='hot')
+    cbar = plt.colorbar(im, shrink=0.55)
+
+    #Add labels to the plot
+    #The basic x labels - metrics used
+    xlabels = [['precision', 'recall', 'f1-score'] * len(application_output_basenames)][0]
+
+    #ylabels - parameter combos, or nicknames for them
+    try:
+        ylabels = nicknames
+    except NameError:
+        ylabels = parameter_combos
+
+    _ = ax.set_xticks(np.arange(len(xlabels)), labels=xlabels)
+    _ = ax.set_yticks(np.arange(len(ylabels)), labels=ylabels)
+
+    #add labels for the test regions the stats refer to
+    test_regions = [a.split('_model_')[1] for a in application_output_basenames]
+    for n, region in enumerate(test_regions):
+        ax.text(n*3+1, len(parameter_combos), region, ha='center')
+    
+    #distinguish/delineate the test regions with vertical lines
+    for i in range(len(application_output_basenames)):
+        ax.axvline(i*3 - 0.5, color='cyan', ls='-', lw=2)
+
+    #Annotate the heatmap with performance metric values
+    for i in range(len(ylabels)):
+        for j in range(len(xlabels)):
+            if stats_array[i, j] >= 0.5:
+                color = 'k'
+            else:
+                color = 'w'
+            _ = ax.text(j, i, stats_array[i, j], ha="center", va="center", color=color)
 
 
 if __name__ == "__main__":
