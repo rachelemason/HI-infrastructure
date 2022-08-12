@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-08-11
+#REM 2022-08-12
 
 """
 Contains functions to help with:
 - setting up and visualizing training data with the BFGN package
-- looping over training datasets and parameter combinations and
-  visualizing results
+- looping over BFGN models with different training datasets and
+  parameter combinations, and visualizing results
 """
 
 import os
@@ -23,6 +23,7 @@ import gdal
 import fiona
 import rasterio
 from sklearn.metrics import classification_report
+from joblib import Parallel, delayed
 
 #BFGN relies on an old version of tensorflow that results in various
 #messages and FutureWarnings. Can't do much about that, so they
@@ -35,6 +36,8 @@ warnings.filterwarnings("ignore", message=r"Passing", category=FutureWarning)
 import tensorflow as tf #import only needed for suppressing warnings
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
 tf.logging.set_verbosity(tf.logging.ERROR)
+#Suppress tf info messages when doing multiprocessing
+os.environ["KMP_WARNINGS"] = "FALSE"
 
 import bfgn.reporting.reports
 from bfgn.configuration import configs
@@ -317,27 +320,146 @@ class Loops():
             setattr(self, key, application_data[key])
         for key in iteration_data:
             setattr(self, key, iteration_data[key])
-        self.default_out = None #defined in loop_over_configs()
         self.stats_array = None #defined in loop_over_configs()
 
 
-    def _archive_and_tidy(self, num):
+    def _archive_and_tidy(self, num, data_out, model_out):
         """
         Helper method for loop_over_configs(). Archives model reports and settings files, and also
         removes now-redundant model and data directories.
         """
 
         #archive the model report and settings file
-        shutil.move(f'{self.default_out}model_report.pdf',\
+        shutil.move(f'{model_out}model_report.pdf',\
                     f'{self.out_path}combo_{num}/model_report.pdf')
         shutil.move(f'new_settings_{num}.yaml',\
                     f'{self.out_path}combo_{num}/new_settings_{num}.yaml')
 
         #delete any existing munged data and model output
-        shutil.rmtree('./data_out', ignore_errors=True)
-        shutil.rmtree(self.default_out, ignore_errors=True)
+        shutil.rmtree(data_out, ignore_errors=True)
+        shutil.rmtree(model_out, ignore_errors=True)
 
 
+    def run_with_new_params(self, idx, params):
+        """
+        """
+                      
+        #get the current set of parameters
+        combo_dict = {}
+        for i, j in enumerate(params):
+            name = list(self.permutations.keys())[i]
+            combo_dict[name] = j
+
+        #create a new settings file with these parameters
+        #(could probably find a way of not re-opening the settings file every time)
+        newlines = []
+        found_model_out = False
+        with open('settings.yaml', 'r', encoding='utf-8') as f:
+            for line in f:
+                if 'model_training:' in line:
+                      found_model_out = True
+                #identify and edit lines containing parameters to be changed
+                if any(ele in line for ele in self.permutations.keys()):
+                    item = line.split(':')[0].strip()
+                    try:
+                        newline = f'  {item}: {combo_dict[item]}\n'
+                        newlines.append(newline)
+                    except KeyError as err:
+                        #probably means there is something wrong with the input permutations
+                        print(f'WARNING: not changing parameter {err} \n')
+                        newlines.append(line)
+                #make separate model/data output directories for different parameter combos - 
+                #needed for running in parallel
+                elif 'dir_out:' in line:
+                    newline = f'  {line.strip()}_{idx}\n'
+                    if found_model_out:
+                        model_out = newline.split(':')[1]+'/'
+                    else:
+                        data_out = newline.split(':')[1]+'/'
+                    newlines.append(newline)
+                else:
+                    newlines.append(line)
+
+        #create a new settings file and output dir for this parameter combo
+        with open(f'new_settings_{idx}.yaml', 'w', encoding='utf-8') as f:
+            for line in newlines:
+                f.write(line)
+        os.makedirs(f'{self.out_path}combo_{idx}', exist_ok=True)
+
+        #delete existing munged data and model output to avoid errors
+        #TODO: replace hardcoded './data_out' with value read from config file,
+        #like for model output dir
+        shutil.rmtree(data_out, ignore_errors=True)
+        shutil.rmtree(model_out, ignore_errors=True)
+
+        #fit the model using this parameter combo, suppressing the very verbose output
+        with io.capture_output():
+            config = configs.create_config_from_file(f'new_settings_{idx}.yaml')
+            data_container = data_core.DataContainer(config)
+            data_container.build_or_load_rawfile_data(rebuild=True)
+            data_container.build_or_load_scalers()
+            data_container.load_sequences()
+            experiment = experiments.Experiment(config)
+            experiment.build_or_load_model(data_container=data_container)
+            experiment.fit_model_with_data_container(data_container, resume_training=True)
+            final_report = bfgn.reporting.reports.Reporter(data_container, experiment, config)
+            final_report.create_model_report()
+
+            #for each test region, apply the model and get stats
+            for i, _f in enumerate(self.app_features):
+                #apply the model
+                apply_model_to_data.apply_model_to_site(experiment.model, data_container, _f,
+                                                        model_out+self.app_outnames[i])
+                #convert tif to array
+                applied_model = tif_to_array(model_out+self.app_outnames[i]+'.tif')
+                #archive the applied model tif
+                shutil.move(f'{model_out+self.app_outnames[i]}.tif',\
+                               f"{self.out_path}combo_{idx}/{self.app_outnames[i]}.tif")
+                #make pdf showing applied model
+                show_applied_model(applied_model, zoom=self.zooms[i], original_img=_f[0],\
+                                       responses=self.app_responses[i], filename=\
+                                       f"{self.out_path}combo_{idx}/{self.app_outnames[i]}\
+                                       .pdf")
+                #get performance metrics
+                stats = performance_metrics(applied_model, self.app_responses[i],\
+                                                self.app_boundaries[i])
+
+                #stats for class 1 (building)
+                self.stats_array[idx, i*3] = np.round(stats['1.0']['precision'], 2)
+                self.stats_array[idx, i*3+1] = np.round(stats['1.0']['recall'], 2)
+                self.stats_array[idx, i*3+2] = np.round(stats['1.0']['f1-score'], 2)
+
+        #TODO: record/return number of training samples for future use/plots
+        n_samples = np.sum([len(n) for n in data_container.features])
+        print(f'{n_samples} training samples were extracted from the data\n')
+
+        #archive model report and config file for this parameter combo/setting
+        self._archive_and_tidy(idx, data_out, model_out)
+
+        #close all figures in the hope of not creating memory problems
+        plt.close('all')
+                      
+                      
+    def loop_over_configs2(self):
+        """
+        Loops over BFGN configurations (can be training data or other parameters in the
+        config file), and returns a numpy array of model performance metrics (precision,
+        recall, F1-score) for all combinations.
+        This function intentionally produces much less diagnostic info than if the model
+        were fit outside it, using direct calls to BFGN; looping over parameters assumes
+        the user already knows what they're doing.
+        """
+
+        #Array to hold the performance metrics
+        self.stats_array = np.zeros((len(self.parameter_combos),\
+                                     len(self.app_features)*3))
+
+        #Loop over the parameter combos, fit model  record metrics
+        fits = Parallel(n_jobs=2, verbose=True)(delayed(self.run_with_new_params)\
+                       (idx=idx, params=params) for idx, params in enumerate(self.parameter_combos))
+
+                      
+                      
     def loop_over_configs(self):
         """
         Loops over BFGN configurations (can be training data or other parameters in the
@@ -367,8 +489,11 @@ class Loops():
             #create a new settings file with these parameters
             #(could probably find a way of not re-opening the settings file every time)
             newlines = []
+            found_model_out = False
             with open('settings.yaml', 'r', encoding='utf-8') as f:
                 for line in f:
+                    if 'model_training:' in line:
+                        found_model_out = True
                     #identify and edit lines containing parameters to be changed
                     if any(ele in line for ele in self.permutations.keys()):
                         item = line.split(':')[0].strip()
@@ -379,11 +504,15 @@ class Loops():
                             #probably means there is something wrong with the input permutations
                             print(f'WARNING: not changing parameter {err} \n')
                             newlines.append(line)
-                    #find where the model output is going to go; will end up being 2nd instance
-                    #of 'dir_out' in the config file, which is what we want
+                    #make separate model/data output directories for different parameter combos - 
+                    #needed for running in parallel
                     elif 'dir_out:' in line:
-                        self.default_out = line.split(':')[1].strip()+'/'
-                        newlines.append(line)
+                        newline = f'  {line.strip()}_{idx}\n'
+                        if found_model_out:
+                            model_out = newline.split(':')[1]+'/'
+                        else:
+                            data_out = newline.split(':')[1]+'/'
+                        newlines.append(newline)
                     else:
                         newlines.append(line)
 
@@ -396,8 +525,8 @@ class Loops():
             #delete existing munged data and model output to avoid errors
             #TODO: replace hardcoded './data_out' with value read from config file,
             #like for model output dir
-            shutil.rmtree('./data_out', ignore_errors=True)
-            shutil.rmtree(self.default_out, ignore_errors=True)
+            shutil.rmtree(data_out, ignore_errors=True)
+            shutil.rmtree(model_out, ignore_errors=True)
 
             #fit the model using this parameter combo, suppressing the very verbose output
             with io.capture_output():
@@ -416,11 +545,11 @@ class Loops():
                 for i, _f in enumerate(self.app_features):
                     #apply the model
                     apply_model_to_data.apply_model_to_site(experiment.model, data_container, _f,
-                                                        self.default_out+self.app_outnames[i])
+                                                            model_out+self.app_outnames[i])
                     #convert tif to array
-                    applied_model = tif_to_array(self.default_out+self.app_outnames[i]+'.tif')
+                    applied_model = tif_to_array(model_out+self.app_outnames[i]+'.tif')
                     #archive the applied model tif
-                    shutil.move(f'{self.default_out+self.app_outnames[i]}.tif',\
+                    shutil.move(f'{model_out+self.app_outnames[i]}.tif',\
                                 f"{self.out_path}combo_{idx}/{self.app_outnames[i]}.tif")
                     #make pdf showing applied model
                     show_applied_model(applied_model, zoom=self.zooms[i], original_img=_f[0],\
