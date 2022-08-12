@@ -3,7 +3,10 @@
 #REM 2022-08-11
 
 """
-Contains functions to help with setting up and visualizing training data with the BFGN package
+Contains functions to help with:
+- setting up and visualizing training data with the BFGN package
+- looping over training datasets and parameter combinations and
+  visualizing results
 """
 
 import os
@@ -21,20 +24,22 @@ import fiona
 import rasterio
 from sklearn.metrics import classification_report
 
-#suppress warnings that arise as an old version of tf is imported by bfgn
+#BFGN relies on an old version of tensorflow that results in various
+#messages and FutureWarnings. Can't do much about that, so they
+#are suppressed below.
+
+#first, disable pylint messages caused by calling warnings before imports completed
+#pylint: disable=wrong-import-position
+
 warnings.filterwarnings("ignore", message=r"Passing", category=FutureWarning)
+import tensorflow as tf #import only needed for suppressing warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+tf.logging.set_verbosity(tf.logging.ERROR)
+
 import bfgn.reporting.reports
 from bfgn.configuration import configs
 from bfgn.data_management import data_core, apply_model_to_data
 from bfgn.experiments import experiments
-
-#suppress tf 'Your CPU supports instructions...' message and some deprecation-type warnings
-import tensorflow as tf
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-tf.logging.set_verbosity(tf.logging.ERROR)
-
-#Suppress warnings raised when lots of plots are opened
-warnings.filterwarnings("ignore", message=r"Passing", category=RuntimeWarning)
 
 
 def input_files_from_config(config_file, print_files=True):
@@ -45,7 +50,7 @@ def input_files_from_config(config_file, print_files=True):
     """
 
     filedict = {}
-    with open(config_file, 'r') as f:
+    with open(config_file, 'r', encoding='utf-8') as f:
         for line in f:
             for kind in ['feature_files:', 'response_files:', 'boundary_files:']:
                 if kind in line:
@@ -299,147 +304,231 @@ def performance_metrics(applied_model, responses, boundary_file):
     return stats
 
 
-def loop_over_configs(parameter_combos, permutations, application_feature_files,\
-                      application_response_files, application_boundary_files,\
-                      application_output_basenames, outpath, zooms):
+class Loops():
     """
+    Methods for looping over BFGN parameter combinations and evaluating results.
     """
 
-    #Array to hold the performance metrics
-    stats_array = np.zeros((len(parameter_combos), len(application_feature_files)*3))
+   #using settatr in __init__ is nice but causes pylint to barf, so
+   #pylint: disable=no-member
 
-    #Loop over the parameter combos, fit model  record metrics
-    for idx, params in enumerate(parameter_combos):
+    def __init__(self, application_data, iteration_data):
+        for key in application_data:
+            setattr(self, key, application_data[key])
+        for key in iteration_data:
+            setattr(self, key, iteration_data[key])
+        self.default_out = None #defined in loop_over_configs()
+        self.stats_array = None #defined in loop_over_configs()
 
-        #get the current set of parameters
-        combo_dict = {}
-        for i, j in enumerate(params):
-            name = list(permutations.keys())[i]
-            combo_dict[name] = j
 
-        print('\n===================================================')
-        print(f'Testing parameter combination #{idx}: {combo_dict}\n')
-
-        #create a new settings file with these parameters
-        #(could probably find a way of not re-opening the settings file every time)
-        newlines = []
-        with open('settings.yaml', 'r') as f:
-            for line in f:
-                #identify and edit lines containing parameters to be changed
-                if any(ele in line for ele in permutations.keys()):
-                    item = line.split(':')[0].strip()
-                    try:
-                        newline = f'  {item}: {combo_dict[item]}\n'
-                        newlines.append(newline)
-                    except KeyError as err:
-                        #this probably means there is something wrong with the input permutations
-                        print(f'WARNING: not changing parameter {err} \n')
-                        newlines.append(line)
-                else:
-                    newlines.append(line)
-
-        with open(f'new_settings_{idx}.yaml', 'w') as f:
-            for line in newlines:
-                f.write(line)
-
-        #delete existing munged data and model output
-        shutil.rmtree('./data_out', ignore_errors=True)
-        shutil.rmtree('./model_out', ignore_errors=True)
-        #create output dir for this specific parameter combo
-        os.makedirs(f'combo_{idx}', exist_ok=True)
-
-        #fit the model using this parameter combo, suppressing very verbose output
-        with io.capture_output():
-            config = configs.create_config_from_file(f'new_settings_{idx}.yaml')
-            data_container = data_core.DataContainer(config)
-            data_container.build_or_load_rawfile_data(rebuild=True)
-            data_container.build_or_load_scalers()
-            data_container.load_sequences()
-            experiment = experiments.Experiment(config)
-            experiment.build_or_load_model(data_container=data_container)
-            experiment.fit_model_with_data_container(data_container, resume_training=True)
-            final_report = bfgn.reporting.reports.Reporter(data_container, experiment, config)
-            final_report.create_model_report()
-
-        #for each test region, apply the model and get stats
-        for i, _f in enumerate(application_feature_files):
-            #apply the model
-            bfgn.data_management.apply_model_to_data.apply_model_to_site(experiment.model,
-                                                                    data_container,
-                                                                    _f,
-                                                                    application_output_basenames[i])
-            #convert tif to array
-            applied_model = tif_to_array(application_output_basenames[i]+'.tif')
-            #archive the applied model tif
-            shutil.move(f'{application_output_basenames[i]}.tif',\
-                        f"combo_{idx}/{application_output_basenames[i].replace(outpath, '')}.tif")
-            #make pdf showing applied model
-            show_applied_model(applied_model, zoom=zooms[i], original_img=_f[0],\
-                               responses=application_response_files[i], filename=\
-                               f"combo_{idx}/{application_output_basenames[i].replace(outpath, '')}\
-                               .pdf")
-            #get performance metrics
-            stats = performance_metrics(applied_model, application_response_files[i],\
-                                                    application_boundary_files[i])
-
-            #stats for class 1 (building)
-            stats_array[idx, i*3] = np.round(stats['1.0']['precision'], 2)
-            stats_array[idx, i*3+1] = np.round(stats['1.0']['recall'], 2)
-            stats_array[idx, i*3+2] = np.round(stats['1.0']['f1-score'], 2)
-
-        n_samples = np.sum([len(n) for n in data_container.features])
-        print(f'\n{n_samples} training samples were extracted from the data\n')
+    def _archive_and_tidy(self, num):
+        """
+        Helper method for loop_over_configs(). Archives model reports and settings files, and also
+        removes now-redundant model and data directories.
+        """
 
         #archive the model report and settings file
-        shutil.move('./model_out/model_report.pdf' , f'combo_{idx}/model_report.pdf')
-        shutil.move(f'new_settings_{idx}.yaml' , f'combo_{idx}/new_settings_{idx}.yaml')
+        shutil.move(f'{self.default_out}model_report.pdf',\
+                    f'{self.out_path}combo_{num}/model_report.pdf')
+        shutil.move(f'new_settings_{num}.yaml',\
+                    f'{self.out_path}combo_{num}/new_settings_{num}.yaml')
 
-        #close all figures in the hope of not creating memory problems by having too many
-        plt.close('all')
+        #delete any existing munged data and model output
+        shutil.rmtree('./data_out', ignore_errors=True)
+        shutil.rmtree(self.default_out, ignore_errors=True)
 
-    return stats_array
-                               
-                               
-def parameter_heatmap(stats_array, permutations, application_output_basenames, parameter_combos, nicknames=None):
-    """
-    """
-                               
-    print(f'Parameters tested:{[k for k in permutations.keys()]}')
 
-    _, ax = plt.subplots(figsize=(10, 10))
-    im = ax.imshow(stats_array, vmin=0, vmax=1, cmap='hot')
-    cbar = plt.colorbar(im, shrink=0.55)
+    def loop_over_configs(self):
+        """
+        Loops over BFGN configurations (can be training data or other parameters in the
+        config file), and returns a numpy array of model performance metrics (precision,
+        recall, F1-score) for all combinations.
+        This function intentionally produces much less diagnostic info than if the model
+        were fit outside it, using direct calls to BFGN; looping over parameters assumes
+        the user already knows what they're doing.
+        """
 
-    #Add labels to the plot
-    #The basic x labels - metrics used
-    xlabels = [['precision', 'recall', 'f1-score'] * len(application_output_basenames)][0]
+        #Array to hold the performance metrics
+        self.stats_array = np.zeros((len(self.parameter_combos),\
+                                     len(self.app_features)*3))
 
-    #ylabels - parameter combos, or nicknames for them
-    try:
-        ylabels = nicknames
-    except NameError:
-        ylabels = parameter_combos
+        #Loop over the parameter combos, fit model  record metrics
+        for idx, params in enumerate(self.parameter_combos):
 
-    _ = ax.set_xticks(np.arange(len(xlabels)), labels=xlabels)
-    _ = ax.set_yticks(np.arange(len(ylabels)), labels=ylabels)
+            #get the current set of parameters
+            combo_dict = {}
+            for i, j in enumerate(params):
+                name = list(self.permutations.keys())[i]
+                combo_dict[name] = j
 
-    #add labels for the test regions the stats refer to
-    test_regions = [a.split('_model_')[1] for a in application_output_basenames]
-    for n, region in enumerate(test_regions):
-        ax.text(n*3+1, len(parameter_combos), region, ha='center')
-    
-    #distinguish/delineate the test regions with vertical lines
-    for i in range(len(application_output_basenames)):
-        ax.axvline(i*3 - 0.5, color='cyan', ls='-', lw=2)
+            print('\n===================================================')
+            print(f'Testing parameter combination #{idx}: {combo_dict}\n')
 
-    #Annotate the heatmap with performance metric values
-    for i in range(len(ylabels)):
-        for j in range(len(xlabels)):
-            if stats_array[i, j] >= 0.5:
-                color = 'k'
-            else:
-                color = 'w'
-            _ = ax.text(j, i, stats_array[i, j], ha="center", va="center", color=color)
+            #create a new settings file with these parameters
+            #(could probably find a way of not re-opening the settings file every time)
+            newlines = []
+            with open('settings.yaml', 'r', encoding='utf-8') as f:
+                for line in f:
+                    #identify and edit lines containing parameters to be changed
+                    if any(ele in line for ele in self.permutations.keys()):
+                        item = line.split(':')[0].strip()
+                        try:
+                            newline = f'  {item}: {combo_dict[item]}\n'
+                            newlines.append(newline)
+                        except KeyError as err:
+                            #probably means there is something wrong with the input permutations
+                            print(f'WARNING: not changing parameter {err} \n')
+                            newlines.append(line)
+                    #find where the model output is going to go; will end up being 2nd instance
+                    #of 'dir_out' in the config file, which is what we want
+                    elif 'dir_out:' in line:
+                        self.default_out = line.split(':')[1].strip()+'/'
+                        newlines.append(line)
+                    else:
+                        newlines.append(line)
+
+            #create a new settings file and output dir for this parameter combo
+            with open(f'new_settings_{idx}.yaml', 'w', encoding='utf-8') as f:
+                for line in newlines:
+                    f.write(line)
+            os.makedirs(f'{self.out_path}combo_{idx}', exist_ok=True)
+
+            #delete existing munged data and model output to avoid errors
+            #TODO: replace hardcoded './data_out' with value read from config file,
+            #like for model output dir
+            shutil.rmtree('./data_out', ignore_errors=True)
+            shutil.rmtree(self.default_out, ignore_errors=True)
+
+            #fit the model using this parameter combo, suppressing the very verbose output
+            with io.capture_output():
+                config = configs.create_config_from_file(f'new_settings_{idx}.yaml')
+                data_container = data_core.DataContainer(config)
+                data_container.build_or_load_rawfile_data(rebuild=True)
+                data_container.build_or_load_scalers()
+                data_container.load_sequences()
+                experiment = experiments.Experiment(config)
+                experiment.build_or_load_model(data_container=data_container)
+                experiment.fit_model_with_data_container(data_container, resume_training=True)
+                final_report = bfgn.reporting.reports.Reporter(data_container, experiment, config)
+                final_report.create_model_report()
+
+                #for each test region, apply the model and get stats
+                for i, _f in enumerate(self.app_features):
+                    #apply the model
+                    apply_model_to_data.apply_model_to_site(experiment.model, data_container, _f,
+                                                        self.default_out+self.app_outnames[i])
+                    #convert tif to array
+                    applied_model = tif_to_array(self.default_out+self.app_outnames[i]+'.tif')
+                    #archive the applied model tif
+                    shutil.move(f'{self.default_out+self.app_outnames[i]}.tif',\
+                                f"{self.out_path}combo_{idx}/{self.app_outnames[i]}.tif")
+                    #make pdf showing applied model
+                    show_applied_model(applied_model, zoom=self.zooms[i], original_img=_f[0],\
+                                       responses=self.app_responses[i], filename=\
+                                       f"{self.out_path}combo_{idx}/{self.app_outnames[i]}\
+                                       .pdf")
+                    #get performance metrics
+                    stats = performance_metrics(applied_model, self.app_responses[i],\
+                                                self.app_boundaries[i])
+
+                    #stats for class 1 (building)
+                    self.stats_array[idx, i*3] = np.round(stats['1.0']['precision'], 2)
+                    self.stats_array[idx, i*3+1] = np.round(stats['1.0']['recall'], 2)
+                    self.stats_array[idx, i*3+2] = np.round(stats['1.0']['f1-score'], 2)
+
+            #TODO: record/return number of training samples for future use/plots
+            n_samples = np.sum([len(n) for n in data_container.features])
+            print(f'{n_samples} training samples were extracted from the data\n')
+
+            #archive model report and config file for this parameter combo/setting
+            self._archive_and_tidy(idx)
+
+            #close all figures in the hope of not creating memory problems
+            plt.close('all')
+
+
+    def parameter_heatmap(self):
+        """
+        Plots a heatmap of precision, recall and F1 score for a set of model test regions and
+        parameter combinations, using <stats_array> produced by the loop_over_configs function.
+        """
+
+        print(f'Parameters tested:{list(self.permutations.keys())}')
+
+        _, ax = plt.subplots(figsize=(10, 10))
+        img = ax.imshow(self.stats_array, vmin=0, vmax=1, cmap='hot')
+        _ = plt.colorbar(img, shrink=0.55)
+
+        #add labels to the plot
+        #the basic x labels - metrics used
+        xlabels = [['precision', 'recall', 'f1-score'] * len(self.app_outnames)][0]
+
+        #ylabels - parameter combos, or nicknames for them
+        if self.nicknames is not None:
+            ylabels = self.nicknames
+        else:
+            ylabels = self.parameter_combos
+
+        _ = ax.set_xticks(np.arange(len(xlabels)), labels=xlabels)
+        _ = ax.set_yticks(np.arange(len(ylabels)), labels=ylabels)
+
+        #add labels for the test regions the stats refer to
+        test_regions = [a.split('_model_')[1] for a in self.app_outnames]
+        for n, region in enumerate(test_regions):
+            ax.text(n*3+1, len(self.parameter_combos), f'Model applied to {region}', ha='center')
+
+        #add vertical lines to distinguish/delineate the test regions
+        for i in range(len(self.app_outnames)):
+            ax.axvline(i*3 - 0.5, color='cyan', ls='-', lw=2)
+
+        #annotate the heatmap with performance metric values
+        for i in range(len(ylabels)):
+            for j in range(len(xlabels)):
+                if self.stats_array[i, j] >= 0.5:
+                    color = 'k'
+                else:
+                    color = 'w'
+                _ = ax.text(j, i, self.stats_array[i, j], ha="center", va="center", color=color)
+
+        plt.savefig(self.out_path+'heatmap.png', dpi=400)
+
+
+    def results_by_training_data(self):
+        """
+        Creates plots that show performance metrics as a function of training
+        data set; one subplot for each of the files to which the model output was applied.
+        """
+
+        fig, _ = plt.subplots(1, 3, figsize=(12, 4))
+
+        for (j, _), ax in zip(enumerate(self.nicknames), fig.axes):
+            precision = []
+            recall =[]
+            f_1 = []
+            for i in range(self.stats_array.shape[0]):
+                precision.append(self.stats_array[i, j*3])
+                recall.append(self.stats_array[i, j*3+1])
+                f_1.append(self.stats_array[i, j*3+2])
+            ax.plot(range(len(precision)), precision, color='b', marker='o',\
+                     ls='-.', label='Precision')
+            ax.plot(range(len(recall)), recall, color='r', marker='^',\
+                     ls=':', label='Recall')
+            ax.plot(range(len(f_1)), f_1, color='k', marker='s', ls='-',\
+                     label='F1 score')
+            if j == 0:
+                ax.legend(loc='lower right')
+
+            _ = ax.set_xticks(np.arange(len(self.nicknames)), labels=self.nicknames)
+            ax.set_ylabel('Precision/Recall/F1-score')
+
+            ax.set_ylim([0, 1])
+
+            title = self.app_outnames[j]
+            title = title.split('_')[-1]
+            ax.set_title(f'Model applied to {title}')
+        plt.tight_layout()
+
+        plt.savefig(self.out_path+'metrics_by_training_data.png', dpi=400)
 
 
 if __name__ == "__main__":
