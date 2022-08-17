@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-08-12
+#REM 2022-08-16
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import warnings
+import json
 import ast
 from IPython.utils import io
 import numpy as np
@@ -352,7 +353,7 @@ class Loops(Utils, AppliedModel):
             setattr(self, key, application_data[key])
         for key in iteration_data:
             setattr(self, key, iteration_data[key])
-        self.stats_array = None #defined in loop_over_configs()
+        self.stats_array = None #defined in chunks()
         self.default_out = None #defined in loop_over_configs()
 
         Utils.__init__(self)
@@ -374,9 +375,54 @@ class Loops(Utils, AppliedModel):
         #delete any existing munged data and model output
         shutil.rmtree(data_out, ignore_errors=True)
         shutil.rmtree(model_out, ignore_errors=True)
+                          
+                          
+    def chunks(self, size=4, use_existing=True):
+        """
+        Divide the tuple containing parameter combinations (self.parameter_combos)
+        into pieces of size=4 parameter combos, feed them into loop_over_configs,
+        and write results to files (as well as putting model performance stats into
+        self.stats_array). If use_existing=True, look for existing model output instead
+        of running the model from scratch. This enables picking up and restarting
+        from where we left off in the event that the code stops running partway through
+        a long sequence of parameters. NB: this approach is fragile because it
+        assumes that the results in existing files correspond to the parameter combos
+        the user currently wants; no checks are made. Run this method with use_existing=False
+        if the parameter combos are changed in the accompanying Jupyter notebook (i.e.,
+        if self.parameter_combos changes)
+        """
+        
+        #Array to hold the performance metrics
+        self.stats_array = np.zeros((len(self.parameter_combos),\
+                                     len(self.app_features)*3))
+        
+        combo = 0
+        for i in range (0, len(self.parameter_combos), size):
+                          
+            if use_existing:
+                try:
+                    with open(f'{self.out_path}combo_{combo}.json', 'r') as f:
+                          stats = json.load(f)
+                          print(f'Loading stats for batch {combo} from file')
+                except FileNotFoundError:
+                    print(f'Saved stats not found for batch {combo}')
 
+            else:
+                batch = self.parameter_combos[i:i+size]
+                stats = self.loop_over_configs(batch)
 
-    def loop_over_configs(self):
+                with open(f'{self.out_path}combo_{combo}.json', 'w') as f:
+                    json.dump(stats, f)              
+                          
+            #stats for class 1 (building)
+            for idx, _ in enumerate(stats):
+                self.stats_array[combo, idx*3] = np.round(stats[idx]['1.0']['precision'], 2)
+                self.stats_array[combo, idx*3+1] = np.round(stats[idx]['1.0']['recall'], 2)
+                self.stats_array[combo, idx*3+2] = np.round(stats[idx]['1.0']['f1-score'], 2)
+            combo += 1
+   
+
+    def loop_over_configs(self, parameter_combos):
         """
         Loops over BFGN configurations (can be training data or other parameters in the
         config file), and returns a numpy array of model performance metrics (precision,
@@ -385,13 +431,11 @@ class Loops(Utils, AppliedModel):
         were fit outside it, using direct calls to BFGN; looping over parameters assumes
         the user already knows what they're doing.
         """
-
-        #Array to hold the performance metrics
-        self.stats_array = np.zeros((len(self.parameter_combos),\
-                                     len(self.app_features)*3))
+                          
+        stats = []
 
         #Loop over the parameter combos, fit model  record metrics
-        for idx, params in enumerate(self.parameter_combos):
+        for idx, params in enumerate(parameter_combos):
 
             #get the current set of parameters
             combo_dict = {}
@@ -400,7 +444,9 @@ class Loops(Utils, AppliedModel):
                 combo_dict[name] = j
 
             print('\n===================================================')
-            print(f'Testing parameter combination #{idx}: {combo_dict}\n')
+            print(f'Testing parameter combination #{idx}:\n')
+            for k, v in combo_dict.items():
+                print(f'{k}: {v}')
 
             #create a new settings file with these parameters
             #(could probably find a way of not re-opening the settings file every time)
@@ -464,13 +510,8 @@ class Loops(Utils, AppliedModel):
                                        f"{self.out_path}combo_{idx}/{self.app_outnames[i]}\
                                        .pdf")
                     #get performance metrics
-                    stats = self.performance_metrics(applied_model, self.app_responses[i],\
-                                                self.app_boundaries[i])
-
-                    #stats for class 1 (building)
-                    self.stats_array[idx, i*3] = np.round(stats['1.0']['precision'], 2)
-                    self.stats_array[idx, i*3+1] = np.round(stats['1.0']['recall'], 2)
-                    self.stats_array[idx, i*3+2] = np.round(stats['1.0']['f1-score'], 2)
+                    stats.append(self.performance_metrics(applied_model, self.app_responses[i],\
+                                                self.app_boundaries[i]))
 
             #TODO: record/return number of training samples for future use/plots
             n_samples = np.sum([len(n) for n in data_container.features])
@@ -481,6 +522,8 @@ class Loops(Utils, AppliedModel):
 
             #close all figures in the hope of not creating memory problems
             plt.close('all')
+                          
+            return stats
 
 
     def parameter_heatmap(self):
@@ -553,15 +596,17 @@ class Loops(Utils, AppliedModel):
                      label='F1 score')
             if j == 0:
                 ax.legend(loc='lower right')
+                ax.set_ylabel('Precision/Recall/F1-score')
 
             _ = ax.set_xticks(np.arange(len(self.nicknames)), labels=self.nicknames)
-            ax.set_ylabel('Precision/Recall/F1-score')
+            ax.set_xlabel('Model training dataset(s)')
 
             ax.set_ylim([0, 1])
 
             title = self.app_outnames[j]
             title = title.split('_')[-1]
             ax.set_title(f'Model applied to {title}')
+
         plt.tight_layout()
 
         plt.savefig(self.out_path+'metrics_by_training_data.png', dpi=400)
