@@ -375,8 +375,8 @@ class Loops(Utils, AppliedModel):
         #delete any existing munged data and model output
         shutil.rmtree(data_out, ignore_errors=True)
         shutil.rmtree(model_out, ignore_errors=True)
-                          
-                          
+
+
     def chunks(self, size=4, use_existing=True):
         """
         Divide the tuple containing parameter combinations (self.parameter_combos)
@@ -391,19 +391,19 @@ class Loops(Utils, AppliedModel):
         if the parameter combos are changed in the accompanying Jupyter notebook (i.e.,
         if self.parameter_combos changes)
         """
-        
+
         #Array to hold the performance metrics
         self.stats_array = np.zeros((len(self.parameter_combos),\
                                      len(self.app_features)*3))
-        
+
         combo = 0
         for i in range (0, len(self.parameter_combos), size):
-                          
+
             if use_existing:
                 try:
-                    with open(f'{self.out_path}combo_{combo}.json', 'r') as f:
-                          stats = json.load(f)
-                          print(f'Loading stats for batch {combo} from file')
+                    with open(f'{self.out_path}combo_{combo}.json', 'r', encoding='utf-8') as f:
+                        stats = json.load(f)
+                        print(f'Loading stats for batch {combo} from file')
                 except FileNotFoundError:
                     print(f'Saved stats not found for batch {combo}')
 
@@ -411,16 +411,25 @@ class Loops(Utils, AppliedModel):
                 batch = self.parameter_combos[i:i+size]
                 stats = self.loop_over_configs(batch)
 
-                with open(f'{self.out_path}combo_{combo}.json', 'w') as f:
-                    json.dump(stats, f)              
-                          
-            #stats for class 1 (building)
-            for idx, _ in enumerate(stats):
-                self.stats_array[combo, idx*3] = np.round(stats[idx]['1.0']['precision'], 2)
-                self.stats_array[combo, idx*3+1] = np.round(stats[idx]['1.0']['recall'], 2)
-                self.stats_array[combo, idx*3+2] = np.round(stats[idx]['1.0']['f1-score'], 2)
+                with open(f'{self.out_path}combo_{combo}.json', 'w', encoding='utf-8') as f:
+                    json.dump(stats, f)
+
+            #Indexing here gets complicated. Variable <stats> contains len(self.app_features)
+            #items per parameter combo, and len(batch) items for each of those. We want to
+            #deconstruct that into an ndarray with one row for each parameter combo, and
+            #(precision, recall, and f1-score) for each of self.app_features in the columns
+            step = int(len(stats) / len(self.app_features))
+            n = 0
+            for i in range (0, len(stats), len(self.app_features)):
+                #stats for class 1 (building)
+                statsbatch = stats[i:i+len(self.app_features)]
+                for idx, data in enumerate(statsbatch):
+                    self.stats_array[combo*step+n, idx*3] = np.round(data['1.0']['precision'], 2)
+                    self.stats_array[combo*step+n, idx*3+1] = np.round(data['1.0']['recall'], 2)
+                    self.stats_array[combo*step+n, idx*3+2] = np.round(data['1.0']['f1-score'], 2)
+                n += 1
             combo += 1
-   
+
 
     def loop_over_configs(self, parameter_combos):
         """
@@ -431,7 +440,7 @@ class Loops(Utils, AppliedModel):
         were fit outside it, using direct calls to BFGN; looping over parameters assumes
         the user already knows what they're doing.
         """
-                          
+
         stats = []
 
         #Loop over the parameter combos, fit model  record metrics
@@ -445,8 +454,8 @@ class Loops(Utils, AppliedModel):
 
             print('\n===================================================')
             print(f'Testing parameter combination #{idx}:\n')
-            for k, v in combo_dict.items():
-                print(f'{k}: {v}')
+            for key, value in combo_dict.items():
+                print(f'{key}: {value}')
 
             #create a new settings file with these parameters
             #(could probably find a way of not re-opening the settings file every time)
@@ -522,8 +531,8 @@ class Loops(Utils, AppliedModel):
 
             #close all figures in the hope of not creating memory problems
             plt.close('all')
-                          
-            return stats
+
+        return stats
 
 
     def parameter_heatmap(self):
