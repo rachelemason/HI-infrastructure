@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-08-16
+#REM 2022-08-18
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -134,7 +134,7 @@ class Utils():
         return mask
 
 
-    def _hillshade(self, ax, to_plot):
+    def hillshade(self, ax, to_plot):
         """
         Helper function for show_input_data() etc. Plots data on an axis using
         hillshading, using default parameters for sun azimuth and altitude.
@@ -169,7 +169,7 @@ class TrainingData(Utils):
         map_array[map_array == map_tif.GetRasterBand(1).GetNoDataValue()] = np.nan
 
         if hillshade:
-            self._hillshade(ax1, map_array)
+            self.hillshade(ax1, map_array)
         else:
             ax1.imshow(map_array)
 
@@ -299,7 +299,7 @@ class AppliedModel():
         original = original[zoom[0]:zoom[1], zoom[2]:zoom[3]]
 
         if hillshade:
-            utils._hillshade(ax4, original)
+            utils.hillshade(ax4, original)
         else:
             ax4.imshow(original)
 
@@ -307,6 +307,18 @@ class AppliedModel():
 
         if filename is not None:
             plt.savefig(filename, dpi=400)
+
+
+    @classmethod
+    def printstats(cls, statsdict):
+        """
+        Display the dictionary of performance stats returned by self.performance_metrics()
+        as a pandas dataframe. INCOMPLETE
+        """
+
+        print('Class | Precision | Recall | F1-score | Support')
+        for key, vals in statsdict.items():
+            print(key, [np.round(v, 2) for v in vals.values()])
 
 
     def performance_metrics(self, applied_model, responses, boundary_file):
@@ -377,6 +389,22 @@ class Loops(Utils, AppliedModel):
         shutil.rmtree(model_out, ignore_errors=True)
 
 
+    def _run_loops(self, i, size, combo):
+        """
+        Helper function for self.chunks(). Creates a batch of parameters and
+        calls loop_over_configs to run the CNN and get the performance stats.
+        """
+
+        batch = self.parameter_combos[i:i+size]
+        stats = self.loop_over_configs(batch)
+
+        with open(f'{self.out_path}combo_{combo}.json', 'w', encoding='utf-8') as f:
+            json.dump(stats, f)
+            print(f'Saved results for batch {combo} to {self.out_path}combo_{combo}.json')
+
+        return stats
+
+
     def chunks(self, size=4, use_existing=True):
         """
         Divide the tuple containing parameter combinations (self.parameter_combos)
@@ -405,14 +433,11 @@ class Loops(Utils, AppliedModel):
                         stats = json.load(f)
                         print(f'Loading stats for batch {combo} from file')
                 except FileNotFoundError:
-                    print(f'Saved stats not found for batch {combo}')
+                    print(f'Saved stats not found for batch {combo}; running model')
+                    stats = self._run_loops(i, size, combo)
 
             else:
-                batch = self.parameter_combos[i:i+size]
-                stats = self.loop_over_configs(batch)
-
-                with open(f'{self.out_path}combo_{combo}.json', 'w', encoding='utf-8') as f:
-                    json.dump(stats, f)
+                stats = self._run_loops(i, size, combo)
 
             #Indexing here gets complicated. Variable <stats> contains len(self.app_features)
             #items per parameter combo, and len(batch) items for each of those. We want to
