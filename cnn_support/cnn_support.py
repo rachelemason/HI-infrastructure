@@ -46,6 +46,21 @@ from bfgn.data_management import data_core, apply_model_to_data
 from bfgn.experiments import experiments
 
 
+def set_permutations_dict():
+    """
+    Just a small function to create a dictionary to hold the filenames that will be
+    used when we iterate over training datasets. Saves a few lines of code in the
+    notebook.
+    """
+
+    permutations = {}
+    permutations['boundary_files'] = ''
+    permutations['feature_files'] = ''
+    permutations['response_files'] = ''
+
+    return permutations
+
+
 class Utils():
     """
     A few tools for file IO, file conversions, getting info from files, etc.
@@ -430,7 +445,8 @@ class Loops(Utils, AppliedModel):
         batchnum = 0
         j = 0
         for i in range (0, len(self.parameter_combos), size):
-            print(f'**Starting batch {batchnum} of {int(np.ceil(len(self.parameter_combos)/size))}')
+            n_batches = int(np.ceil(len(self.parameter_combos)/size))
+            print(f'\n***Starting batch {batchnum} of {n_batches}')
 
             if use_existing:
                 try:
