@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-08-25
+#REM 2022-08-29
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -325,15 +325,25 @@ class AppliedModel():
 
 
     @classmethod
-    def print_stats(cls, statsdict):
+    def record_stats(cls, statsdict, textfile):
         """
-        Display the dictionary of performance stats returned by self.performance_metrics()
-        as a pandas dataframe. INCOMPLETE
+        Write the dictionary of performance stats returned by
+        self.performance_metrics to a text file, and also print to stdout.
+        Using simple string formatting as I can't install pandas in this environment.
         """
 
-        print('Class | Precision | Recall | F1-score | Support')
-        for key, vals in statsdict.items():
-            print(key, [np.round(v, 2) for v in vals.values()])
+        with open(textfile, 'w', encoding='utf-8') as f:
+            f.write('Class       | Precision | Recall | F1-score | Support\n')
+            for key, vals in statsdict.items():
+                try:
+                    vals = [np.round(v, 2) for v in vals.values()]
+                    spc =  ' ' * (18-len(key))
+                    f.write(f'{key}{spc}{vals[0]}      {vals[1]}      {vals[2]}      {vals[3]}\n')
+                except AttributeError:
+                    f.write(f'{key}    {np.round(vals, 2)}\n')
+        with open(textfile, 'r', encoding='utf-8') as f:
+            for line in f.readlines():
+                print(line.strip())
 
 
     def performance_metrics(self, applied_model, responses, boundary_file):
@@ -435,7 +445,8 @@ class Loops(Utils, AppliedModel):
         if self.parameter_combos changes)
         """
 
-        assert len(self.parameter_combos) == len(self.nicknames),\
+        if self.nicknames is not None:
+            assert len(self.parameter_combos) == len(self.nicknames),\
                           'Number of nicknames should equal the number of parameter combinations'
 
         #Array to hold the performance metrics
@@ -446,7 +457,7 @@ class Loops(Utils, AppliedModel):
         j = 0
         for i in range (0, len(self.parameter_combos), size):
             n_batches = int(np.ceil(len(self.parameter_combos)/size))
-            print(f'\n***Starting batch {batchnum} of {n_batches}')
+            print(f'\n***Starting batch {batchnum+1} of {n_batches}')
 
             if use_existing:
                 try:
