@@ -576,8 +576,10 @@ class Loops(Utils, AppliedModel):
                                         responses=self.app_responses[i], filename=\
                                         f"{self.out_path}combo_{num}/{self.app_outnames[i]}.pdf")
                     #get performance metrics
-                    stats.append(self.performance_metrics(applied_model, self.app_responses[i],\
-                                 self.app_boundaries[i]))
+                    metrics = self.performance_metrics(applied_model, self.app_responses[i],\
+                                 self.app_boundaries[i])
+                    stats.append(metrics)
+                    self.record_stats(metrics, self.out_path+'stats.txt')
 
             #TODO: record/return number of training samples for future use/plots
             n_samples = np.sum([len(n) for n in data_container.features])
@@ -644,9 +646,14 @@ class Loops(Utils, AppliedModel):
         data set; one subplot for each of the files to which the model output was applied.
         """
 
-        fig, _ = plt.subplots(1, len(self.app_outnames), figsize=(16, 4))
+        fig, _ = plt.subplots(2, 4, figsize=(16, 8))
 
         for (j, _), ax in zip(enumerate(self.app_outnames), fig.axes):
+            if self.app_types[j] == 'neighbour':
+                colours = ['lightblue', 'blue', 'black']
+            else:
+                colours = ['limegreen', 'green', 'darkgreen']
+
             precision = []
             recall =[]
             f_1 = []
@@ -654,12 +661,12 @@ class Loops(Utils, AppliedModel):
                 precision.append(self.stats_array[i, j*3])
                 recall.append(self.stats_array[i, j*3+1])
                 f_1.append(self.stats_array[i, j*3+2])
-            ax.plot(range(len(precision)), precision, color='b', marker='o',\
-                     ls='-.', label='Precision')
-            ax.plot(range(len(recall)), recall, color='r', marker='^',\
-                     ls=':', label='Recall')
-            ax.plot(range(len(f_1)), f_1, color='k', marker='s', ls='-',\
-                     label='F1 score')
+            ax.plot(range(len(precision)), precision, color=colours[0], marker='o',\
+                        ls='-.', label='Precision')
+            ax.plot(range(len(recall)), recall, color=colours[1], marker='^',\
+                        ls=':', label='Recall')
+            ax.plot(range(len(f_1)), f_1, color=colours[2], marker='s', ls='-',\
+                        label='F1 score')
             if j == 0:
                 ax.legend(loc='lower right')
                 ax.set_ylabel('Precision/Recall/F1-score')
