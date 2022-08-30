@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-08-29
+#REM 2022-08-30
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import warnings
+import glob
 import json
 import ast
 from IPython.utils import io
@@ -397,31 +398,14 @@ class Loops(Utils, AppliedModel):
         AppliedModel.__init__(self)
 
 
-    def _archive_and_tidy(self, num, data_out, model_out):
-        """
-        Helper method for loop_over_configs(). Archives model reports and settings files, and also
-        removes now-redundant model and data directories.
-        """
-
-        #archive the model report and settings file
-        shutil.move(f'{model_out}model_report.pdf',\
-                    f'{self.out_path}combo_{num}/model_report.pdf')
-        shutil.move(f'new_settings_{num}.yaml',\
-                    f'{self.out_path}combo_{num}/new_settings_{num}.yaml')
-
-        #delete any existing munged data and model output
-        shutil.rmtree(data_out, ignore_errors=True)
-        shutil.rmtree(model_out, ignore_errors=True)
-
-
-    def _run_loops(self, i, size, batchnum, rebuild):
+    def _run_loops(self, i, size, batchnum, rebuild, fit_model, apply_model):
         """
         Helper function for self.chunks(). Creates a batch of parameters and
         calls loop_over_configs to run the CNN and get the performance stats.
         """
 
         batch = self.parameter_combos[i:i+size]
-        stats = self.loop_over_configs(batch, i, rebuild)
+        stats = self.loop_over_configs(batch, i, rebuild, fit_model, apply_model)
 
         with open(f'{self.out_path}batch_{batchnum}.json', 'w', encoding='utf-8') as f:
             json.dump(stats, f)
@@ -430,7 +414,8 @@ class Loops(Utils, AppliedModel):
         return stats
 
 
-    def chunks(self, size=4, use_existing=True, rebuild=True):
+    def chunks(self, size=4, use_existing=True, rebuild_data=True, fit_model=True,\
+               apply_model=False):
         """
         Divide the tuple containing parameter combinations (self.parameter_combos)
         into pieces of size=4 parameter combos, feed them into loop_over_configs,
@@ -466,29 +451,31 @@ class Loops(Utils, AppliedModel):
                         print(f'Loading stats for batch {batchnum} from file')
                 except FileNotFoundError:
                     print(f'Saved stats not found for batch {batchnum}; running model')
-                    stats = self._run_loops(i, size, batchnum, rebuild)
+                    stats = self._run_loops(i, size, batchnum, rebuild_data, fit_model, apply_model)
 
             else:
-                stats = self._run_loops(i, size, batchnum, rebuild)
+                stats = self._run_loops(i, size, batchnum, rebuild_data, fit_model, apply_model)
 
             #Indexing here gets complicated. Variable <stats> contains len(self.app_features)
             #items per parameter combo, and len(batch) items for each of those. We want to
             #deconstruct that into an ndarray with one row for each parameter combo, and
             #(precision, recall, and f1-score) for each of self.app_features in the columns
-            for i in range (0, len(stats), len(self.app_features)):
-                #stats for one parameter combo, for len(self.app_features) test fields
-                print(f'Stats for combo {j} going into row {j} of stats_array...')
-                statsbatch = stats[i:i+len(self.app_features)]
-                for idx, data in enumerate(statsbatch):
-                    #stats for class '1.0' (buildings)
-                    self.stats_array[j, idx*3] = np.round(data['1.0']['precision'], 2)
-                    self.stats_array[j, idx*3+1] = np.round(data['1.0']['recall'], 2)
-                    self.stats_array[j, idx*3+2] = np.round(data['1.0']['f1-score'], 2)
-                j += 1
-            batchnum += 1
+            if len(stats) > 0:
+                for i in range (0, len(stats), len(self.app_features)):
+                    #stats for one parameter combo, for len(self.app_features) test fields
+                    print(f'Stats for combo {j} going into row {j} of stats_array...')
+                    statsbatch = stats[i:i+len(self.app_features)]
+                    for idx, data in enumerate(statsbatch):
+                        #stats for class '1.0' (buildings)
+                        self.stats_array[j, idx*3] = np.round(data['1.0']['precision'], 2)
+                        self.stats_array[j, idx*3+1] = np.round(data['1.0']['recall'], 2)
+                        self.stats_array[j, idx*3+2] = np.round(data['1.0']['f1-score'], 2)
+                    j += 1
+                batchnum += 1
 
 
-    def loop_over_configs(self, parameter_combos, start_idx, rebuild=True):
+    def loop_over_configs(self, parameter_combos, start_idx, rebuild=True, fit_model=True,\
+                         apply_model=True):
         """
         Loops over BFGN configurations (can be training data or other parameters in the
         config file), and returns a numpy array of model performance metrics (precision,
@@ -517,36 +504,22 @@ class Loops(Utils, AppliedModel):
 
             #create a new settings file with these parameters
             #(could probably find a way of not re-opening the settings file every time)
-            newlines = []
-            with open('settings.yaml', 'r', encoding='utf-8') as f:
-                for line in f:
-                    #identify and edit lines containing parameters to be changed
-                    if any(ele in line for ele in self.permutations.keys()):
-                        item = line.split(':')[0].strip()
-                        try:
-                            newline = f'  {item}: {combo_dict[item]}\n'
-                            newlines.append(newline)
-                        except KeyError as err:
-                            #probably means there is something wrong with the input permutations
-                            print(f'WARNING: not changing parameter {err} \n')
-                            newlines.append(line)
-                    #make separate model/data output directories for different parameter combos -
-                    #needed for running in parallel
-                    elif 'dir_out:' in line:
-                        self.default_out = line.split(':')[1].strip()+'/'
-                        newlines.append(line)
-                    else:
-                        newlines.append(line)
+            self._create_settings_file(combo_dict, num)
 
-            #create a new settings file and output dir for this parameter combo
-            with open(f'new_settings_{num}.yaml', 'w', encoding='utf-8') as f:
-                for line in newlines:
-                    f.write(line)
-            os.makedirs(f'{self.out_path}combo_{num}', exist_ok=True)
+            outdir = f'{self.out_path}combo_{num}/'
+            os.makedirs(outdir, exist_ok=True) #TODO - NECESSARY? EXIST_OK=True?
 
-            #delete existing munged data and model output to avoid errors
-            shutil.rmtree('./data_out', ignore_errors=True)
-            shutil.rmtree(self.default_out, ignore_errors=True)
+            #delete existing munged data and model output to avoid errors (unless
+            #we're using existing training data and/or applying an existing model)
+            if rebuild:
+                for f in glob.glob(outdir+'munged*'):
+                    os.remove(f)
+            if fit_model:
+                for pattern in ['app*', 'config*', 'log*', 'model*', 'data_container*',\
+                                'stats*']:
+                    for f in glob.glob(outdir+pattern):
+                        os.remove(f)
+                shutil.rmtree(outdir+'tensorboard', ignore_errors=True)
 
             #fit the model using this parameter combo, suppressing the very verbose output
             with io.capture_output():
@@ -557,41 +530,72 @@ class Loops(Utils, AppliedModel):
                 data_container.load_sequences()
                 experiment = experiments.Experiment(config)
                 experiment.build_or_load_model(data_container=data_container)
-                experiment.fit_model_with_data_container(data_container, resume_training=True)
-                final_report = bfgn.reporting.reports.Reporter(data_container, experiment, config)
-                final_report.create_model_report()
+                if fit_model:
+                    experiment.fit_model_with_data_container(data_container, resume_training=False)
+                    final_report = bfgn.reporting.reports.Reporter(data_container, experiment,\
+                                                                   config)
+                    final_report.create_model_report()
 
                 #for each test region, apply the model and get stats
-                for i, _f in enumerate(self.app_features):
-                    #apply the model
-                    apply_model_to_data.apply_model_to_site(experiment.model, data_container, _f,
-                                                            self.default_out+self.app_outnames[i])
-                    #convert tif to array
-                    applied_model = self.tif_to_array(self.default_out+self.app_outnames[i]+'.tif')
-                    #archive the applied model tif
-                    shutil.move(f'{self.default_out+self.app_outnames[i]}.tif',\
-                                f"{self.out_path}combo_{num}/{self.app_outnames[i]}.tif")
-                    #make pdf showing applied model
-                    self.show_applied_model(applied_model, zoom=self.zooms[i], original_img=_f[0],\
-                                        responses=self.app_responses[i], filename=\
+                if apply_model:
+                    for i, _f in enumerate(self.app_features):
+                        #apply the model
+                        apply_model_to_data.apply_model_to_site(experiment.model, data_container,\
+                                                                _f, outdir+self.app_outnames[i])
+                        #convert tif to array
+                        applied_model = self.tif_to_array(outdir+self.app_outnames[i]+'.tif')
+                        #make pdf showing applied model
+                        self.show_applied_model(applied_model, zoom=self.zooms[i],\
+                                                original_img=_f[0],\
+                                                responses=self.app_responses[i], filename=\
                                         f"{self.out_path}combo_{num}/{self.app_outnames[i]}.pdf")
-                    #get performance metrics
-                    metrics = self.performance_metrics(applied_model, self.app_responses[i],\
+                        #get performance metrics
+                        metrics = self.performance_metrics(applied_model, self.app_responses[i],\
                                  self.app_boundaries[i])
-                    stats.append(metrics)
-                    self.record_stats(metrics, self.out_path+'stats.txt')
+                        stats.append(metrics)
+                        self.record_stats(metrics, outdir+'stats.txt')
 
             #TODO: record/return number of training samples for future use/plots
             n_samples = np.sum([len(n) for n in data_container.features])
-            print(f'{n_samples} training samples were extracted from the data\n')
-
-            #archive model report and config file for this parameter combo/setting
-            self._archive_and_tidy(num, './data_out', self.default_out)
+            print(f'Training dataset converted into {n_samples} samples\n')
 
             #close all figures in the hope of not creating memory problems
             plt.close('all')
 
         return stats
+
+
+    def _create_settings_file(self, combo_dict, num):
+        """
+        Helper method for self.loop_over_configs. Writes the settings file
+        needed for the model to run with new parameter or input file settings.
+        Returns: nothing.
+        """
+
+        newlines = []
+        with open('settings.yaml', 'r', encoding='utf-8') as f:
+            for line in f:
+                #identify and edit lines containing parameters to be changed
+                if any(ele in line for ele in self.permutations.keys()):
+                    item = line.split(':')[0].strip()
+                    try:
+                        newline = f'  {item}: {combo_dict[item]}\n'
+                        newlines.append(newline)
+                    except KeyError as err:
+                        #probably means there is something wrong with the input permutations
+                        print(f'WARNING: not changing parameter {err} \n')
+                        newlines.append(line)
+                #make separate model/data output directories for different parameter combos -
+                elif 'dir_out:' in line:
+                    line = f'  dir_out: {self.out_path}combo_{num}/\n'
+                    newlines.append(line)
+                else:
+                    newlines.append(line)
+
+        #create a new settings file and output dir for this parameter combo
+        with open(f'new_settings_{num}.yaml', 'w', encoding='utf-8') as f:
+            for line in newlines:
+                f.write(line)
 
 
     def parameter_heatmap(self):
