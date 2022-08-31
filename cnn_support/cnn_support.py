@@ -392,21 +392,19 @@ class Loops(Utils, AppliedModel):
             setattr(self, key, application_data[key])
         for key in iteration_data:
             setattr(self, key, iteration_data[key])
-        self.stats_array = None #defined in chunks()
+        self.stats_array = None #defined in loop_over_configs()
         self.default_out = None #defined in loop_over_configs()
 
         Utils.__init__(self)
         AppliedModel.__init__(self)
 
 
-    def train_or_load_model(self, idx, combo_dict, rebuild, fit_model, outdir):
+    def _train_or_load_model(self, idx, rebuild, fit_model, outdir):
         """
-        Train a CNN or load an existing model. Returns the BFGN Experiment and
-        DataContainer objects that are needed for applying models to data.
+        Helper method for self.loop_over_configs. Train a CNN or load an existing model.
+        Returns the BFGN Experiment and DataContainer objects that are needed for applying
+        models to data.
         """
-
-        #create a new settings file with these parameters
-        self._create_settings_file(combo_dict, idx)
 
         config = configs.create_config_from_file(f'new_settings_{idx}.yaml')
         data_container = data_core.DataContainer(config)
@@ -437,15 +435,15 @@ class Loops(Utils, AppliedModel):
         return experiment, data_container
 
 
-    def apply_model(self, idx, combo_dict, outdir):
+    def _apply_model(self, idx, outdir):
         """
-        Apply an existing trained model to data (test fields), write image files,
-        and return performance metrics.
+        Helper method for self.loop_over_configs. Apply an existing trained model
+        to data (test fields), write image files, and return performance metrics.
         """
 
         #retrieve the fitted model
-        experiment, data_container = self.train_or_load_model(idx, combo_dict,\
-                                     rebuild=False, fit_model=False, outdir=outdir)
+        experiment, data_container = self.train_or_load_model(idx, rebuild=False,\
+                                                              fit_model=False, outdir=outdir)
 
         #for each test region, apply the model and get stats
         stats = []
@@ -472,11 +470,11 @@ class Loops(Utils, AppliedModel):
         return stats
 
 
-    def create_stats_array(self, stats):
+    def _create_stats_array(self, stats):
         """
-        Convert big unwieldy list of performance metrics created by
-        self.loop_over_configs to self.stats_array which is understood by
-        plotting methods.
+        Helper method for self.loop_over_configs. Convert big unwieldy list of
+        performance metrics created by self.loop_over_configs to self.stats_array
+        which is understood by plotting methods.
         """
 
         #Array to hold the performance metrics
@@ -491,8 +489,8 @@ class Loops(Utils, AppliedModel):
                 self.stats_array[i, idx*3+2] = np.round(data['1.0']['f1-score'], 2)
 
 
-    def loop_over_configs(self, rebuild_data=True, fit_model=True,\
-                         apply_model=True, use_existing=True):
+    def loop_over_configs(self, rebuild_data=True, fit_model=True, apply_model=True,\
+                          use_existing=True):
         """
         Loops over BFGN configurations (can be training data or other parameters in the
         config file), and returns a numpy array of model performance metrics (precision,
@@ -517,6 +515,9 @@ class Loops(Utils, AppliedModel):
             for key, value in combo_dict.items():
                 print(f'{key}: {value}')
 
+            #create a new settings file with these parameters
+            self._create_settings_file(combo_dict, idx)
+
             outdir = f'{self.out_path}combo_{idx}/'
             #delete existing munged data to avoid errors
             if rebuild_data:
@@ -524,16 +525,19 @@ class Loops(Utils, AppliedModel):
                     os.remove(f)
             os.makedirs(outdir, exist_ok=True)
 
-            #fit model (or not, if existing results OK)
-            if use_existing and fit_model:
-                if os.path.exists(f'{outdir}model.h5'):
-                    print(f'***Model {outdir}model.h5 exists; nothing to do here')
+            #fit model (or not, if existing results OK). Models are written to
+            #.h5 files so nothing is returned here.
+            if fit_model:
+                if use_existing:
+                    if os.path.exists(f'{outdir}model.h5'):
+                        print(f'***Model {outdir}model.h5 exists; nothing to do here')
+                    else:
+                        print(f'***No model found for {outdir}model.h5; will train a new one')
+                        _, _ = self._train_or_load_model(idx, rebuild_data,\
+                                                         fit_model, outdir)
                 else:
-                    _, _ = self.train_or_load_model(idx, combo_dict, rebuild_data,\
-                                                    fit_model, outdir)
-            elif not use_existing and fit_model:
-                _, _ = self.train_or_load_model(idx, combo_dict, rebuild_data,\
-                                                fit_model, outdir)
+                    _, _ = self._train_or_load_model(idx, rebuild_data,\
+                                                     fit_model, outdir)
 
             #apply model to data or retrieve existing performance stats
             if apply_model:
@@ -544,16 +548,16 @@ class Loops(Utils, AppliedModel):
                         print(f'Loaded stats for {outdir} from file')
                     except FileNotFoundError:
                         print(f'Saved stats not found in {outdir}; applying model')
-                        stats = self.apply_model(idx, combo_dict, outdir)
+                        stats = self._apply_model(idx, outdir)
                         plt.close('all')
                 else:
-                    stats = self.apply_model(idx, combo_dict, outdir)
+                    stats = self._apply_model(idx, outdir)
                     plt.close('all')
                 all_stats.append(stats)
 
-        #Once all stats have been gathered
+        #Once all stats have been gathered, reformat nicely
         if apply_model:
-            self.create_stats_array(all_stats)
+            self._create_stats_array(all_stats)
 
 
     def _create_settings_file(self, combo_dict, num):
