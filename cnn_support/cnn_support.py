@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-08-30
+#REM 2022-08-31
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -370,6 +370,7 @@ class AppliedModel():
         expected = mask.flatten()
         predicted = list(predicted[~(np.isnan(expected))])
         expected = list(expected[~(np.isnan(expected))])
+        print(len(predicted), len(expected))
 
         # get performance metrics
         print('Calculating metrics...')
@@ -398,84 +399,100 @@ class Loops(Utils, AppliedModel):
         AppliedModel.__init__(self)
 
 
-    def _run_loops(self, i, size, batchnum, rebuild, fit_model, apply_model):
+    def train_or_load_model(self, idx, combo_dict, rebuild, fit_model, outdir):
         """
-        Helper function for self.chunks(). Creates a batch of parameters and
-        calls loop_over_configs to run the CNN and get the performance stats.
+        Train a CNN or load an existing model. Returns the BFGN Experiment and
+        DataContainer objects that are needed for applying models to data.
         """
 
-        batch = self.parameter_combos[i:i+size]
-        stats = self.loop_over_configs(batch, i, rebuild, fit_model, apply_model)
+        #create a new settings file with these parameters
+        self._create_settings_file(combo_dict, idx)
 
-        with open(f'{self.out_path}batch_{batchnum}.json', 'w', encoding='utf-8') as f:
+        config = configs.create_config_from_file(f'new_settings_{idx}.yaml')
+        data_container = data_core.DataContainer(config)
+        data_container.build_or_load_rawfile_data(rebuild=rebuild)
+        data_container.build_or_load_scalers()
+        data_container.load_sequences()
+        n_samples = np.sum([len(n) for n in data_container.features])
+        print(f'Training dataset contained {n_samples} samples')
+
+        experiment = experiments.Experiment(config)
+        experiment.build_or_load_model(data_container=data_container)
+
+        if fit_model:
+
+            #Remove any existing model files
+            for pattern in ['app*', 'config*', 'log*', 'model*', 'data_container*',\
+                        'stats*']:
+                for f in glob.glob(outdir+pattern):
+                    os.remove(f)
+            shutil.rmtree(outdir+'tensorboard', ignore_errors=True)
+
+            with io.capture_output():
+                experiment.fit_model_with_data_container(data_container, resume_training=False)
+                final_report = bfgn.reporting.reports.Reporter(data_container, experiment,\
+                                                                   config)
+                final_report.create_model_report()
+
+        return experiment, data_container
+
+
+    def apply_model(self, idx, combo_dict, outdir):
+        """
+        Apply an existing trained model to data (test fields), write image files,
+        and return performance metrics.
+        """
+
+        #retrieve the fitted model
+        experiment, data_container = self.train_or_load_model(idx, combo_dict,\
+                                     rebuild=False, fit_model=False, outdir=outdir)
+
+        #for each test region, apply the model and get stats
+        stats = []
+        with io.capture_output():
+            for i, _f in enumerate(self.app_features):
+                #apply the model
+                apply_model_to_data.apply_model_to_site(experiment.model, data_container,\
+                                                        _f, outdir+self.app_outnames[i])
+                #convert tif to array
+                applied_model = self.tif_to_array(outdir+self.app_outnames[i]+'.tif')
+                #make pdf showing applied model
+                self.show_applied_model(applied_model, zoom=self.zooms[i],\
+                                        original_img=_f[0],\
+                                        responses=self.app_responses[i], filename=\
+                                        f"{outdir}{self.app_outnames[i]}.pdf")
+                #get performance metrics
+                stats.append(self.performance_metrics(applied_model, self.app_responses[i],\
+                                     self.app_boundaries[i]))
+
+        #store the performance stats for later use
+        with open(f'{outdir}stats.json', 'w', encoding='utf-8') as f:
             json.dump(stats, f)
-            print(f'Saved results for batch {batchnum} to {self.out_path}batch_{batchnum}.json')
 
         return stats
 
 
-    def chunks(self, size=4, use_existing=True, rebuild_data=True, fit_model=True,\
-               apply_model=False):
+    def create_stats_array(self, stats):
         """
-        Divide the tuple containing parameter combinations (self.parameter_combos)
-        into pieces of size=4 parameter combos, feed them into loop_over_configs,
-        and write results to files (as well as putting model performance stats into
-        self.stats_array). If use_existing=True, look for existing model output instead
-        of running the model from scratch. This enables picking up and restarting
-        from where we left off in the event that the code stops running partway through
-        a long sequence of parameters. NB: this approach is fragile because it
-        assumes that the results in existing files correspond to the parameter combos
-        the user currently wants; no checks are made. Run this method with use_existing=False
-        if the parameter combos are changed in the accompanying Jupyter notebook (i.e.,
-        if self.parameter_combos changes)
+        Convert big unwieldy list of performance metrics created by
+        self.loop_over_configs to self.stats_array which is understood by
+        plotting methods.
         """
-
-        if self.nicknames is not None:
-            assert len(self.parameter_combos) == len(self.nicknames),\
-                          'Number of nicknames should equal the number of parameter combinations'
 
         #Array to hold the performance metrics
         self.stats_array = np.zeros((len(self.parameter_combos),\
                                      len(self.app_features)*3)) #3 is for the 3 metrics
 
-        batchnum = 0
-        j = 0
-        for i in range (0, len(self.parameter_combos), size):
-            n_batches = int(np.ceil(len(self.parameter_combos)/size))
-            print(f'\n***Starting batch {batchnum+1} of {n_batches}')
-
-            if use_existing:
-                try:
-                    with open(f'{self.out_path}batch_{batchnum}.json', 'r', encoding='utf-8') as f:
-                        stats = json.load(f)
-                        print(f'Loading stats for batch {batchnum} from file')
-                except FileNotFoundError:
-                    print(f'Saved stats not found for batch {batchnum}; running model')
-                    stats = self._run_loops(i, size, batchnum, rebuild_data, fit_model, apply_model)
-
-            else:
-                stats = self._run_loops(i, size, batchnum, rebuild_data, fit_model, apply_model)
-
-            #Indexing here gets complicated. Variable <stats> contains len(self.app_features)
-            #items per parameter combo, and len(batch) items for each of those. We want to
-            #deconstruct that into an ndarray with one row for each parameter combo, and
-            #(precision, recall, and f1-score) for each of self.app_features in the columns
-            if len(stats) > 0:
-                for i in range (0, len(stats), len(self.app_features)):
-                    #stats for one parameter combo, for len(self.app_features) test fields
-                    print(f'Stats for combo {j} going into row {j} of stats_array...')
-                    statsbatch = stats[i:i+len(self.app_features)]
-                    for idx, data in enumerate(statsbatch):
-                        #stats for class '1.0' (buildings)
-                        self.stats_array[j, idx*3] = np.round(data['1.0']['precision'], 2)
-                        self.stats_array[j, idx*3+1] = np.round(data['1.0']['recall'], 2)
-                        self.stats_array[j, idx*3+2] = np.round(data['1.0']['f1-score'], 2)
-                    j += 1
-                batchnum += 1
+        for i, _ in enumerate(stats):
+            for idx, data in enumerate(stats[i]):
+                #stats for class '1.0' (buildings)
+                self.stats_array[i, idx*3] = np.round(data['1.0']['precision'], 2)
+                self.stats_array[i, idx*3+1] = np.round(data['1.0']['recall'], 2)
+                self.stats_array[i, idx*3+2] = np.round(data['1.0']['f1-score'], 2)
 
 
-    def loop_over_configs(self, parameter_combos, start_idx, rebuild=True, fit_model=True,\
-                         apply_model=True):
+    def loop_over_configs(self, rebuild_data=True, fit_model=True,\
+                         apply_model=True, use_existing=True):
         """
         Loops over BFGN configurations (can be training data or other parameters in the
         config file), and returns a numpy array of model performance metrics (precision,
@@ -485,11 +502,9 @@ class Loops(Utils, AppliedModel):
         the user already knows what they're doing.
         """
 
-        stats = []
-
-        #Loop over the parameter combos, fit model  record metrics
-        for idx, params in enumerate(parameter_combos):
-            num = start_idx + idx
+        #Loop over the parameter combos, fit and/or apply model
+        all_stats = []
+        for idx, params in enumerate(self.parameter_combos):
 
             #get the current set of parameters
             combo_dict = {}
@@ -498,71 +513,47 @@ class Loops(Utils, AppliedModel):
                 combo_dict[name] = j
 
             print('\n===================================================')
-            print(f'Testing parameter combination #{num}:\n')
+            print(f'Working on parameter combination #{idx}:\n')
             for key, value in combo_dict.items():
                 print(f'{key}: {value}')
 
-            #create a new settings file with these parameters
-            #(could probably find a way of not re-opening the settings file every time)
-            self._create_settings_file(combo_dict, num)
-
-            outdir = f'{self.out_path}combo_{num}/'
-            os.makedirs(outdir, exist_ok=True) #TODO - NECESSARY? EXIST_OK=True?
-
-            #delete existing munged data and model output to avoid errors (unless
-            #we're using existing training data and/or applying an existing model)
-            if rebuild:
+            outdir = f'{self.out_path}combo_{idx}/'
+            #delete existing munged data to avoid errors
+            if rebuild_data:
                 for f in glob.glob(outdir+'munged*'):
                     os.remove(f)
-            if fit_model:
-                for pattern in ['app*', 'config*', 'log*', 'model*', 'data_container*',\
-                                'stats*']:
-                    for f in glob.glob(outdir+pattern):
-                        os.remove(f)
-                shutil.rmtree(outdir+'tensorboard', ignore_errors=True)
+            os.makedirs(outdir, exist_ok=True)
 
-            #fit the model using this parameter combo, suppressing the very verbose output
-            with io.capture_output():
-                config = configs.create_config_from_file(f'new_settings_{num}.yaml')
-                data_container = data_core.DataContainer(config)
-                data_container.build_or_load_rawfile_data(rebuild=rebuild)
-                data_container.build_or_load_scalers()
-                data_container.load_sequences()
-                experiment = experiments.Experiment(config)
-                experiment.build_or_load_model(data_container=data_container)
-                if fit_model:
-                    experiment.fit_model_with_data_container(data_container, resume_training=False)
-                    final_report = bfgn.reporting.reports.Reporter(data_container, experiment,\
-                                                                   config)
-                    final_report.create_model_report()
+            #fit model (or not, if existing results OK)
+            if use_existing and fit_model:
+                if os.path.exists(f'{outdir}model.h5'):
+                    print(f'***Model {outdir}model.h5 exists; nothing to do here')
+                else:
+                    _, _ = self.train_or_load_model(idx, combo_dict, rebuild_data,\
+                                                    fit_model, outdir)
+            elif not use_existing and fit_model:
+                _, _ = self.train_or_load_model(idx, combo_dict, rebuild_data,\
+                                                fit_model, outdir)
 
-                #for each test region, apply the model and get stats
-                if apply_model:
-                    for i, _f in enumerate(self.app_features):
-                        #apply the model
-                        apply_model_to_data.apply_model_to_site(experiment.model, data_container,\
-                                                                _f, outdir+self.app_outnames[i])
-                        #convert tif to array
-                        applied_model = self.tif_to_array(outdir+self.app_outnames[i]+'.tif')
-                        #make pdf showing applied model
-                        self.show_applied_model(applied_model, zoom=self.zooms[i],\
-                                                original_img=_f[0],\
-                                                responses=self.app_responses[i], filename=\
-                                        f"{self.out_path}combo_{num}/{self.app_outnames[i]}.pdf")
-                        #get performance metrics
-                        metrics = self.performance_metrics(applied_model, self.app_responses[i],\
-                                 self.app_boundaries[i])
-                        stats.append(metrics)
-                        self.record_stats(metrics, outdir+'stats.txt')
+            #apply model to data or retrieve existing performance stats
+            if apply_model:
+                if use_existing:
+                    try:
+                        with open(f'{outdir}stats.json', 'r', encoding='utf-8') as f:
+                            stats = json.load(f)
+                        print(f'Loaded stats for {outdir} from file')
+                    except FileNotFoundError:
+                        print(f'Saved stats not found in {outdir}; applying model')
+                        stats = self.apply_model(idx, combo_dict, outdir)
+                        plt.close('all')
+                else:
+                    stats = self.apply_model(idx, combo_dict, outdir)
+                    plt.close('all')
+                all_stats.append(stats)
 
-            #TODO: record/return number of training samples for future use/plots
-            n_samples = np.sum([len(n) for n in data_container.features])
-            print(f'Training dataset converted into {n_samples} samples\n')
-
-            #close all figures in the hope of not creating memory problems
-            plt.close('all')
-
-        return stats
+        #Once all stats have been gathered
+        if apply_model:
+            self.create_stats_array(all_stats)
 
 
     def _create_settings_file(self, combo_dict, num):
