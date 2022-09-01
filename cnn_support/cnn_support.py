@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-08-31
+#REM 2022-09-01
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -326,25 +326,21 @@ class AppliedModel():
 
 
     @classmethod
-    def record_stats(cls, statsdict, textfile):
+    def print_stats(cls, statsdict):
         """
-        Write the dictionary of performance stats returned by
-        self.performance_metrics to a text file, and also print to stdout.
-        Using simple string formatting as I can't install pandas in this environment.
+        Pretty print the dictionary of performance stats returned by
+        self.performance_metrics.  Using simple string formatting as
+        I can't install pandas in this environment.
         """
 
-        with open(textfile, 'w', encoding='utf-8') as f:
-            f.write('Class       | Precision | Recall | F1-score | Support\n')
-            for key, vals in statsdict.items():
-                try:
-                    vals = [np.round(v, 2) for v in vals.values()]
-                    spc =  ' ' * (18-len(key))
-                    f.write(f'{key}{spc}{vals[0]}      {vals[1]}      {vals[2]}      {vals[3]}\n')
-                except AttributeError:
-                    f.write(f'{key}    {np.round(vals, 2)}\n')
-        with open(textfile, 'r', encoding='utf-8') as f:
-            for line in f.readlines():
-                print(line.strip())
+        print('Class       | Precision | Recall | F1-score | Support\n')
+        for key, vals in statsdict.items():
+            try:
+                vals = [np.round(v, 2) for v in vals.values()]
+                spc =  ' ' * (18-len(key))
+                print(f'{key}{spc}{vals[0]}      {vals[1]}      {vals[2]}      {vals[3]}')
+            except AttributeError:
+                print(f'{key}    {np.round(vals, 2)}')
 
 
     def performance_metrics(self, applied_model, responses, boundary_file):
@@ -392,7 +388,7 @@ class Loops(Utils, AppliedModel):
             setattr(self, key, application_data[key])
         for key in iteration_data:
             setattr(self, key, iteration_data[key])
-        self.stats_array = None #defined in loop_over_configs()
+        self.stats_array = None #defined in _create_stats_array()
         self.default_out = None #defined in loop_over_configs()
 
         Utils.__init__(self)
@@ -407,6 +403,20 @@ class Loops(Utils, AppliedModel):
         """
 
         config = configs.create_config_from_file(f'new_settings_{idx}.yaml')
+
+        if rebuild:
+            for f in glob.glob(outdir+'munged*'):
+                os.remove(f)
+
+        #Remove any existing model files; doing this outside lower if fit_model
+        #loop so that model.h5 file is definitely gone before starting training
+        if fit_model:
+            for pattern in ['app*', 'config*', 'log*', 'model*', 'data_container*',\
+                            'stats*']:
+                for f in glob.glob(outdir+pattern):
+                    os.remove(f)
+            shutil.rmtree(outdir+'tensorboard', ignore_errors=True)
+
         data_container = data_core.DataContainer(config)
         data_container.build_or_load_rawfile_data(rebuild=rebuild)
         data_container.build_or_load_scalers()
@@ -418,19 +428,13 @@ class Loops(Utils, AppliedModel):
         experiment.build_or_load_model(data_container=data_container)
 
         if fit_model:
-
-            #Remove any existing model files
-            for pattern in ['app*', 'config*', 'log*', 'model*', 'data_container*',\
-                        'stats*']:
-                for f in glob.glob(outdir+pattern):
-                    os.remove(f)
-            shutil.rmtree(outdir+'tensorboard', ignore_errors=True)
-
+            print('Fitting model and creating report...')
             with io.capture_output():
                 experiment.fit_model_with_data_container(data_container, resume_training=False)
                 final_report = bfgn.reporting.reports.Reporter(data_container, experiment,\
                                                                    config)
                 final_report.create_model_report()
+                plt.close('all')
 
         return experiment, data_container
 
@@ -442,7 +446,7 @@ class Loops(Utils, AppliedModel):
         """
 
         #retrieve the fitted model
-        experiment, data_container = self.train_or_load_model(idx, rebuild=False,\
+        experiment, data_container = self._train_or_load_model(idx, rebuild=False,\
                                                               fit_model=False, outdir=outdir)
 
         #for each test region, apply the model and get stats
@@ -489,7 +493,7 @@ class Loops(Utils, AppliedModel):
                 self.stats_array[i, idx*3+2] = np.round(data['1.0']['f1-score'], 2)
 
 
-    def loop_over_configs(self, rebuild_data=True, fit_model=True, apply_model=True,\
+    def loop_over_configs(self, rebuild_data=False, fit_model=True, apply_model=True,\
                           use_existing=True):
         """
         Loops over BFGN configurations (can be training data or other parameters in the
@@ -519,10 +523,6 @@ class Loops(Utils, AppliedModel):
             self._create_settings_file(combo_dict, idx)
 
             outdir = f'{self.out_path}combo_{idx}/'
-            #delete existing munged data to avoid errors
-            if rebuild_data:
-                for f in glob.glob(outdir+'munged*'):
-                    os.remove(f)
             os.makedirs(outdir, exist_ok=True)
 
             #fit model (or not, if existing results OK). Models are written to
@@ -533,11 +533,11 @@ class Loops(Utils, AppliedModel):
                         print(f'***Model {outdir}model.h5 exists; nothing to do here')
                     else:
                         print(f'***No model found for {outdir}model.h5; will train a new one')
-                        _, _ = self._train_or_load_model(idx, rebuild_data,\
-                                                         fit_model, outdir)
+                        _, _ = self._train_or_load_model(idx, rebuild_data, fit_model,\
+                                                         outdir)
                 else:
-                    _, _ = self._train_or_load_model(idx, rebuild_data,\
-                                                     fit_model, outdir)
+                    _, _ = self._train_or_load_model(idx, rebuild_data, fit_model,\
+                                                     outdir)
 
             #apply model to data or retrieve existing performance stats
             if apply_model:
@@ -554,6 +554,9 @@ class Loops(Utils, AppliedModel):
                     stats = self._apply_model(idx, outdir)
                     plt.close('all')
                 all_stats.append(stats)
+
+            #Archive the settings file for this parameter combo
+            shutil.move(f'new_settings_{idx}.yaml', f'{outdir}new_settings_{idx}.yaml')
 
         #Once all stats have been gathered, reformat nicely
         if apply_model:
