@@ -10,6 +10,7 @@ sensing data. Contains classes to help with:
   - visualizing the applied models
   - looping over different training datasets and
     parameter combinations, and visualizing results
+Intended for use with REM's dedicated Jupyter notebooks
 """
 
 import os
@@ -92,7 +93,7 @@ class Utils():
         return filedict['feature_files:'], filedict['response_files:'], filedict['boundary_files:']
 
 
-    def rasterize(self, reference_raster, shapefile_list, replace_existing):
+    def rasterize(self, reference_raster, shapefile, tif_out, replace_existing):
         """
         Converts the .shp files in <shapefile_list> into .tif files, using
         the geometry info in <reference_raster>. Output tif files are written
@@ -102,18 +103,45 @@ class Utils():
         feature_set = gdal.Open(reference_raster, gdal.GA_ReadOnly)
         trans = feature_set.GetGeoTransform()
 
-        for file in shapefile_list:
-            if not replace_existing:
-                if os.path.isfile(file.replace('shp', 'tif')):
-                    print(f"{file.replace('shp', 'tif')} already exists, not recreating")
-                    continue
-            print(f'Rasterizing {file} using {reference_raster} as reference')
-            cmd_str = 'gdal_rasterize ' + file + ' ' + os.path.splitext(file)[0] +\
-                    '.tif -init 0 -burn 1 -te ' + str(trans[0]) + ' ' + str(trans[3] +\
-                    trans[5]*feature_set.RasterYSize) + ' ' + str(trans[0] +\
-                    trans[1]*feature_set.RasterXSize) + ' ' + str(trans[3]) + ' -tr ' +\
-                    str(trans[1]) + ' ' + str(trans[5])
+        def do_the_work():
+            print(f'Rasterizing {shapefile} using {reference_raster} as reference')
+            cmd_str = 'gdal_rasterize ' + shapefile + ' ' + tif_out +\
+            ' -init 0 -burn 1 -te ' + str(trans[0]) + ' ' + str(trans[3] +\
+            trans[5]*feature_set.RasterYSize) + ' ' + str(trans[0] +\
+            trans[1]*feature_set.RasterXSize) + ' ' + str(trans[3]) + ' -tr ' +\
+            str(trans[1]) + ' ' + str(trans[5])
             subprocess.call(cmd_str, shell=True)
+
+        if not replace_existing:
+            if os.path.isfile(shapefile.replace('shp', 'tif')):
+                print(f"{shapefile.replace('shp', 'tif')} already exists, not recreating")
+            else:
+                do_the_work()
+        else:
+            do_the_work()
+
+
+    def extract_raster_section(self, main_file, template, destination, replace_existing=True):
+        """
+        Write the subset of raster <main_file> specified by <template>
+        into <destination> tif.
+        """
+
+        def do_the_work():
+            print(f'Extracting subset of {main_file} defined by {template}')
+            geo = gdal.Open(template)
+            ulx, xres, _, uly, _, yres  = geo.GetGeoTransform()
+            lrx = ulx + (geo.RasterXSize * xres)
+            lry = uly + (geo.RasterYSize * yres)
+            gdal.Translate(destination, gdal.Open(main_file), projWin = [ulx, uly, lrx, lry])
+
+        if not replace_existing:
+            if os.path.isfile(destination):
+                print(f"{destination} already exists, not recreating")
+            else:
+                do_the_work()
+        else:
+            do_the_work()
 
 
     def tif_to_array(self, tif):
@@ -366,7 +394,6 @@ class AppliedModel():
         expected = mask.flatten()
         predicted = list(predicted[~(np.isnan(expected))])
         expected = list(expected[~(np.isnan(expected))])
-        print(len(predicted), len(expected))
 
         # get performance metrics
         print('Calculating metrics...')
