@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-09-01
+#REM 2022-09-07
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -25,6 +25,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.colors import LightSource
 from matplotlib import gridspec
+from matplotlib.patches import Rectangle
 import gdal
 import fiona
 import rasterio
@@ -113,8 +114,8 @@ class Utils():
             subprocess.call(cmd_str, shell=True)
 
         if not replace_existing:
-            if os.path.isfile(shapefile.replace('shp', 'tif')):
-                print(f"{shapefile.replace('shp', 'tif')} already exists, not recreating")
+            if os.path.isfile(tif_out):
+                print(f"{tif_out} already exists, not recreating")
             else:
                 do_the_work()
         else:
@@ -144,16 +145,18 @@ class Utils():
             do_the_work()
 
 
-    def tif_to_array(self, tif):
+    def tif_to_array(self, tif, get_first_only=False):
         """
-        Returns contents of <tif> as a numpy array. Some BFGN methods, like
-        data_management.apply_model_to_data.apply_model_to_site, write a tif
-        instead of returning an array, so this methid is useful for further
+        Returns contents of <tif>[<band>] as a numpy array. Some BFGN methods,
+        like data_management.apply_model_to_data.apply_model_to_site, write a tif
+        instead of returning an array, so this method is useful for further
         operations on those files (but can be used for any tif)
         """
 
         data = gdal.Open(tif, gdal.GA_ReadOnly)
         arr = data.ReadAsArray()
+        if get_first_only and len(arr.shape) > 2:
+            arr = arr[0]
         arr[arr == data.GetRasterBand(1).GetNoDataValue()] = np.nan
 
         return arr
@@ -324,7 +327,11 @@ class AppliedModel():
         #has been applied
         ax1.imshow(applied_model[0], cmap='Greys_r')
         if responses is not None:
-            ax1.imshow(shape, alpha=0.5, cmap='Reds_r')
+            ax1.imshow(shape, alpha=0.7, cmap='Reds_r')
+
+        #Show the area to be zoomed into
+        ax1.add_patch(Rectangle((zoom[2], zoom[0]), zoom[3]-zoom[2], zoom[1]-zoom[0],\
+                               fill=False, edgecolor='r'))
 
         #Zoom into the applied model probabilities
         ax2.imshow(applied_model[0][zoom[0]:zoom[1], zoom[2]:zoom[3]], cmap='Greys_r')
@@ -336,10 +343,11 @@ class AppliedModel():
         if responses is not None:
             ax3.imshow(shape[zoom[0]:zoom[1], zoom[2]:zoom[3]], alpha=0.8, cmap='viridis_r')
 
-        #The original image for which everything was predicted (same subset/zoom region)
+        #The original image for which everything was predicted (same subset/zoom region;
+        #only show the first band if there are >1)
         utils = Utils()
-        original = utils.tif_to_array(original_img)
-        original[original < 0.5] = np.nan
+        original = utils.tif_to_array(original_img, get_first_only=True)
+        #original[original < 0.5] = np.nan #TODO: what was this for?
         original = original[zoom[0]:zoom[1], zoom[2]:zoom[3]]
 
         if hillshade:
@@ -411,6 +419,7 @@ class Loops(Utils, AppliedModel):
    #pylint: disable=no-member
 
     def __init__(self, application_data, iteration_data):
+        self.data_types = None #optionally contained in iteration_data
         for key in application_data:
             setattr(self, key, application_data[key])
         for key in iteration_data:
@@ -480,19 +489,30 @@ class Loops(Utils, AppliedModel):
         stats = []
         with io.capture_output():
             for i, _f in enumerate(self.app_features):
-                #apply the model
+
+                #find the type of input data used and update application filename to match
+                #BFGN needs application data with same number of bands as model training data
+                if self.data_types is not None:
+                    if self.data_types[idx] in self.parameter_combos[idx][1][0][0]:
+                        _f[0] = _f[0].replace('hires_surface', self.data_types[idx])
+                        print('Changing filename', _f[0])
+
                 apply_model_to_data.apply_model_to_site(experiment.model, data_container,\
-                                                        _f, outdir+self.app_outnames[i])
+                                                            _f, outdir+self.app_outnames[i])
                 #convert tif to array
                 applied_model = self.tif_to_array(outdir+self.app_outnames[i]+'.tif')
                 #make pdf showing applied model
+                hillshade = bool('surface' in _f[0])
                 self.show_applied_model(applied_model, zoom=self.zooms[i],\
-                                        original_img=_f[0],\
-                                        responses=self.app_responses[i], filename=\
-                                        f"{outdir}{self.app_outnames[i]}.pdf")
+                                            original_img=_f[0], hillshade=hillshade,\
+                                            responses=self.app_responses[i], filename=\
+                                            f"{outdir}{self.app_outnames[i]}.pdf")
                 #get performance metrics
                 stats.append(self.performance_metrics(applied_model, self.app_responses[i],\
                                      self.app_boundaries[i]))
+
+                if self.data_types is not None:
+                    _f[0] = _f[0].replace(self.data_types[idx], 'hires_surface')
 
         #store the performance stats for later use
         with open(f'{outdir}stats.json', 'w', encoding='utf-8') as f:
