@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-09-07
+#REM 2022-09-08
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -147,7 +147,8 @@ class Utils():
 
     def tif_to_array(self, tif, get_first_only=False):
         """
-        Returns contents of <tif>[<band>] as a numpy array. Some BFGN methods,
+        Returns contents of <tif>as a numpy array, optionally containing only the
+        first band if it's a multi-band dataset. Some BFGN methods,
         like data_management.apply_model_to_data.apply_model_to_site, write a tif
         instead of returning an array, so this method is useful for further
         operations on those files (but can be used for any tif)
@@ -189,6 +190,39 @@ class Utils():
 
         light = LightSource(azdeg=315, altdeg=45)
         ax.imshow(light.hillshade(to_plot), cmap='gray')
+
+
+    @classmethod
+    def create_data_combos(cls, required_data, name, path, location):
+        """
+        Merge selected bands from different data products (e.g. aMCU and DSM),
+        write the resulting array to a tif. Extent and resolution of files must
+        match.
+        """
+
+        print(f'Creating {path}{location}_{name}.tif')
+
+        pieces = []
+        for data_type, bands in required_data.items():
+            with rasterio.open(f'{path}{location}_{data_type}.tif', 'r') as f:
+                meta = f.meta.copy()
+                arr = f.read()
+
+                if len(arr.shape) == 2:
+                    pieces.append(np.expand_dims(arr, 0))
+                elif len(arr.shape) > 2:
+                    for n in bands:
+                        pieces.append(np.expand_dims(arr[n], 0))
+                else:
+                    print('This is a 1D array, something is wrong')
+                    break
+
+        combo = np.vstack(tuple(pieces))
+
+        meta.update({'count': combo.shape[0]})
+
+        with rasterio.open(f'{path}{location}_{name}.tif', 'w', **meta) as f:
+            f.write(combo)
 
 
 class TrainingData(Utils):
