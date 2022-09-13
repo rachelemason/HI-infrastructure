@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-09-08
+#REM 2022-09-12
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -158,6 +158,7 @@ class Utils():
         arr = data.ReadAsArray()
         if get_first_only and len(arr.shape) > 2:
             arr = arr[0]
+        arr = arr.astype(np.float32) #int arrays need to be float for the next line to work
         arr[arr == data.GetRasterBand(1).GetNoDataValue()] = np.nan
 
         return arr
@@ -193,36 +194,40 @@ class Utils():
 
 
     @classmethod
-    def create_data_combos(cls, required_data, name, path, location):
+    def create_data_combos(cls, required_data, name, inpath, outpath, location,\
+                           replace_existing=False):
         """
         Merge selected bands from different data products (e.g. aMCU and DSM),
         write the resulting array to a tif. Extent and resolution of files must
         match.
         """
 
-        print(f'Creating {path}{location}_{name}.tif')
+        if not replace_existing and os.path.isfile(f'{outpath}{location}_{name}.tif'):
+            print(f'{outpath}{location}_{name}.tif exists; not recreating')
 
-        pieces = []
-        for data_type, bands in required_data.items():
-            with rasterio.open(f'{path}{location}_{data_type}.tif', 'r') as f:
-                meta = f.meta.copy()
-                arr = f.read()
+        else:
+            print(f'Creating {outpath}{location}_{name}.tif')
+            pieces = []
+            for data_type, bands in required_data.items():
+                with rasterio.open(f'{inpath}{location}_{data_type}.tif', 'r') as f:
+                    meta = f.meta.copy()
+                    arr = f.read()
 
-                if len(arr.shape) == 2:
-                    pieces.append(np.expand_dims(arr, 0))
-                elif len(arr.shape) > 2:
-                    for n in bands:
-                        pieces.append(np.expand_dims(arr[n], 0))
-                else:
-                    print('This is a 1D array, something is wrong')
-                    break
+                    if len(arr.shape) == 2:
+                        pieces.append(np.expand_dims(arr, 0))
+                    elif len(arr.shape) > 2:
+                        for n in bands:
+                            pieces.append(np.expand_dims(arr[n], 0))
+                    else:
+                        print('This is a 1D array, something is wrong')
+                        break
 
-        combo = np.vstack(tuple(pieces))
+            combo = np.vstack(tuple(pieces))
 
-        meta.update({'count': combo.shape[0]})
+            meta.update({'count': combo.shape[0]})
 
-        with rasterio.open(f'{path}{location}_{name}.tif', 'w', **meta) as f:
-            f.write(combo)
+            with rasterio.open(f'{outpath}{location}_{name}.tif', 'w', **meta) as f:
+                f.write(combo)
 
 
 class TrainingData(Utils):
@@ -342,7 +347,7 @@ class AppliedModel():
 
 
     def show_applied_model(self, applied_model, original_img, zoom, responses=None, hillshade=True,\
-                          filename=None):
+                          threshold=0.90, filename=None):
         """
         Plots the applied model created by
         bfgn.data_management.apply_model_to_data.apply_model_to_site, converted to a numpy array by
@@ -357,9 +362,10 @@ class AppliedModel():
             shape = shape.ReadAsArray()
             shape = np.ma.masked_where(shape < 1.0, shape)
 
-        #Show the applied model probabilities for class 1 over the whole area to which it
+        #Show the applied model probabilities for class 2 over the whole area to which it
         #has been applied
-        ax1.imshow(applied_model[0], cmap='Greys_r')
+        cbar = ax1.imshow(applied_model[1], cmap='GnBu_r')
+        plt.colorbar(cbar, ax=ax1, shrink=0.6, pad=0.01)
         if responses is not None:
             ax1.imshow(shape, alpha=0.7, cmap='Reds_r')
 
@@ -367,11 +373,13 @@ class AppliedModel():
         ax1.add_patch(Rectangle((zoom[2], zoom[0]), zoom[3]-zoom[2], zoom[1]-zoom[0],\
                                fill=False, edgecolor='r'))
 
-        #Zoom into the applied model probabilities
-        ax2.imshow(applied_model[0][zoom[0]:zoom[1], zoom[2]:zoom[3]], cmap='Greys_r')
+        #Convert probability map into binary classes using threshold
+        classes = self.probabilities_to_classes('threshold', applied_model, threshold)
+        ax2.imshow(classes, cmap='Greys')
+        if responses is not None:
+            ax2.imshow(shape, alpha=0.7, cmap='Reds_r')
 
-        #Same but with probabilities converted to binary classes using a threshold
-        classes = self.probabilities_to_classes('threshold', applied_model)
+        #Zoom into the specified subregion
         ax3.imshow(classes[zoom[0]:zoom[1], zoom[2]:zoom[3]], cmap='Greys')
         #Overplot responses (buildings), if available
         if responses is not None:
@@ -509,7 +517,7 @@ class Loops(Utils, AppliedModel):
         return experiment, data_container
 
 
-    def _apply_model(self, idx, outdir):
+    def _apply_model(self, idx, outdir, threshold=0.90):
         """
         Helper method for self.loop_over_configs. Apply an existing trained model
         to data (test fields), write image files, and return performance metrics.
@@ -533,22 +541,37 @@ class Loops(Utils, AppliedModel):
 
                 apply_model_to_data.apply_model_to_site(experiment.model, data_container,\
                                                             _f, outdir+self.app_outnames[i])
-                #convert tif to array
+
                 applied_model = self.tif_to_array(outdir+self.app_outnames[i]+'.tif')
-                #make pdf showing applied model
-                hillshade = bool('surface' in _f[0])
-                self.show_applied_model(applied_model, zoom=self.zooms[i],\
-                                            original_img=_f[0], hillshade=hillshade,\
-                                            responses=self.app_responses[i], filename=\
-                                            f"{outdir}{self.app_outnames[i]}.pdf")
-                #get performance metrics
-                stats.append(self.performance_metrics(applied_model, self.app_responses[i],\
-                                     self.app_boundaries[i]))
+
+                #make pdf showing applied model; record stats - only for files with labelled
+                #responses
+                if self.app_responses[i] is not None:
+                    hillshade = bool('res_surface' in _f[0])
+                    self.show_applied_model(applied_model, zoom=self.zooms[i],\
+                                                original_img=_f[0], hillshade=hillshade,\
+                                                responses=self.app_responses[i],\
+                                                threshold=threshold,\
+                                                filename=f"{outdir}{self.app_outnames[i]}.pdf")
+
+                    stats.append(self.performance_metrics(applied_model, self.app_responses[i],\
+                                                self.app_boundaries[i]))
+
+                #create tif containing applied model as binary classes
+                temp = self.probabilities_to_classes('threshold', applied_model)
+                with rasterio.open(outdir+self.app_outnames[i]+'.tif', 'r') as f:
+                    meta = f.meta.copy()
+                temp = np.expand_dims(temp, 0)
+                temp = temp.astype(np.float32)
+                meta.update({'count': 1})
+                name = self.app_outnames[i].replace('applied', 'threshold')
+                with rasterio.open(outdir+name+'.tif', 'w', **meta) as f:
+                    f.write(temp)
 
                 if self.data_types is not None:
                     _f[0] = _f[0].replace(self.data_types[idx], 'hires_surface')
 
-        #store the performance stats for later use
+        #store the performance stats (if any) for later use
         with open(f'{outdir}stats.json', 'w', encoding='utf-8') as f:
             json.dump(stats, f)
 
@@ -575,7 +598,7 @@ class Loops(Utils, AppliedModel):
 
 
     def loop_over_configs(self, rebuild_data=False, fit_model=True, apply_model=True,\
-                          use_existing=True):
+                          use_existing=True, threshold=0.95):
         """
         Loops over BFGN configurations (can be training data or other parameters in the
         config file), and returns a numpy array of model performance metrics (precision,
@@ -629,10 +652,10 @@ class Loops(Utils, AppliedModel):
                         print(f'Loaded stats for {outdir} from file')
                     except FileNotFoundError:
                         print(f'Saved stats not found in {outdir}; applying model')
-                        stats = self._apply_model(idx, outdir)
+                        stats = self._apply_model(idx, outdir, threshold)
                         plt.close('all')
                 else:
-                    stats = self._apply_model(idx, outdir)
+                    stats = self._apply_model(idx, outdir, threshold)
                     plt.close('all')
                 all_stats.append(stats)
 
@@ -705,7 +728,7 @@ class Loops(Utils, AppliedModel):
         #add labels for the test regions the stats refer to
         test_regions = [a.split('_model_')[1] for a in self.app_outnames]
         for n, region in enumerate(test_regions):
-            ax.text(n*3+1, len(self.parameter_combos), f'Model applied to {region}', ha='center')
+            ax.text(n*3+1, -1, f'Model applied to {region}', ha='center')
 
         #add vertical lines to distinguish/delineate the test regions
         for i in range(len(self.app_outnames)):
@@ -729,7 +752,7 @@ class Loops(Utils, AppliedModel):
         data set; one subplot for each of the files to which the model output was applied.
         """
 
-        fig, _ = plt.subplots(2, 4, figsize=(16, 8))
+        fig, _ = plt.subplots(2, 4, figsize=(16, 10))
 
         for (j, _), ax in zip(enumerate(self.app_outnames), fig.axes):
             if self.app_types[j] == 'neighbour':
@@ -754,7 +777,8 @@ class Loops(Utils, AppliedModel):
                 ax.legend(loc='lower right')
                 ax.set_ylabel('Precision/Recall/F1-score')
 
-            _ = ax.set_xticks(np.arange(len(self.nicknames)), labels=self.nicknames)
+            _ = ax.set_xticks(np.arange(len(self.nicknames)), labels=self.nicknames,\
+                             rotation=45, ha='right')
             ax.set_xlabel('Model training dataset(s)')
 
             ax.set_ylim([0, 1])
