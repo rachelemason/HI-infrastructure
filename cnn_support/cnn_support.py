@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-09-12
+#REM 2022-09-13
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -158,7 +158,8 @@ class Utils():
         arr = data.ReadAsArray()
         if get_first_only and len(arr.shape) > 2:
             arr = arr[0]
-        arr = arr.astype(np.float32) #int arrays need to be float for the next line to work
+        if np.issubdtype(arr.dtype, np.integer):
+            arr = arr.astype(np.float32) #arrays must be float for next line to work
         arr[arr == data.GetRasterBand(1).GetNoDataValue()] = np.nan
 
         return arr
@@ -324,8 +325,46 @@ class AppliedModel():
         pass
 
 
-    def probabilities_to_classes(self, method, applied_model_arr, threshold_val=0.95,\
-                                 nodata_value=-9999):
+    def apply_model(self, config_file, application_file, outfile, move_to, method='threshold'):
+        """
+        Apply an existing model to a new area, convert probabilities to binary classes,
+        and write to some sensible storage location. This method is intended to be used to
+        apply models to large tiles - this could be done via Loops() but the resulting
+        files are so large that they should really be created individually and only when
+        really needed, and immediately moved from Agave to gdcsdata.
+        """
+
+        config = configs.create_config_from_file(config_file)
+        data_container = data_core.DataContainer(config)
+        data_container.build_or_load_rawfile_data(rebuild=False)
+        data_container.build_or_load_scalers()
+        data_container.load_sequences()
+
+        experiment = experiments.Experiment(config)
+        experiment.build_or_load_model(data_container=data_container)
+
+        print(f'Working on {application_file}')
+        apply_model_to_data.apply_model_to_site(experiment.model, data_container,\
+                                                [application_file], outfile)
+
+        utils = Utils()
+        print(f' -- converting {outfile}.tif to array')
+        applied_model = utils.tif_to_array(outfile+'.tif')
+
+        print(' -- getting binary classes')
+        self.probabilities_to_classes(method, applied_model, tif_template=outfile+'.tif')
+
+        #this has to happen in a separate step as writing directly to gdcsdata in
+        #apply_model_to_data step is a recipe for incomplete, corrupted files.
+        os.makedirs(move_to, exist_ok=True)
+        for string in ['*', 'applied']:
+            print(f' -- moving {outfile.replace(string, method)}')
+            shutil.copy2(f"{outfile.replace(string, method)}.tif", move_to)
+            os.remove(f"{outfile.replace(string, method)}.tif")
+
+
+    def probabilities_to_classes(self, method, applied_model_arr, threshold_val=0.9,\
+                                 nodata_value=-9999, tif_template=None):
         """
         Converts the class probabilities in the applied_model array (not tif) into
         binary classes using maximum likelihood or a threshold.
@@ -343,7 +382,26 @@ class AppliedModel():
         else:
             print("<threshold> parameter must be one of ['ML', 'threshold']")
 
+        if tif_template:
+            self.binary_classes_to_tif(output, tif_template, method)
+
         return output
+
+
+    @classmethod
+    def binary_classes_to_tif(cls, arr, template, method):
+        """
+        Create tif containing the model created by self.probabilities_to_classes()
+        """
+
+        with rasterio.open(template, 'r') as f:
+            meta = f.meta.copy()
+        arr = np.expand_dims(arr, 0).astype(np.float32)
+        meta.update({'count': 1})
+        name = template.replace('applied', method)
+        print(name)
+        with rasterio.open(name, 'w', **meta) as f:
+            f.write(arr)
 
 
     def show_applied_model(self, applied_model, original_img, zoom, responses=None, hillshade=True,\
@@ -544,29 +602,16 @@ class Loops(Utils, AppliedModel):
 
                 applied_model = self.tif_to_array(outdir+self.app_outnames[i]+'.tif')
 
-                #make pdf showing applied model; record stats - only for files with labelled
-                #responses
-                if self.app_responses[i] is not None:
-                    hillshade = bool('res_surface' in _f[0])
-                    self.show_applied_model(applied_model, zoom=self.zooms[i],\
+                #make pdf showing applied model; record stats
+                hillshade = bool('res_surface' in _f[0])
+                self.show_applied_model(applied_model, zoom=self.zooms[i],\
                                                 original_img=_f[0], hillshade=hillshade,\
                                                 responses=self.app_responses[i],\
                                                 threshold=threshold,\
                                                 filename=f"{outdir}{self.app_outnames[i]}.pdf")
 
-                    stats.append(self.performance_metrics(applied_model, self.app_responses[i],\
+                stats.append(self.performance_metrics(applied_model, self.app_responses[i],\
                                                 self.app_boundaries[i]))
-
-                #create tif containing applied model as binary classes
-                temp = self.probabilities_to_classes('threshold', applied_model)
-                with rasterio.open(outdir+self.app_outnames[i]+'.tif', 'r') as f:
-                    meta = f.meta.copy()
-                temp = np.expand_dims(temp, 0)
-                temp = temp.astype(np.float32)
-                meta.update({'count': 1})
-                name = self.app_outnames[i].replace('applied', 'threshold')
-                with rasterio.open(outdir+name+'.tif', 'w', **meta) as f:
-                    f.write(temp)
 
                 if self.data_types is not None:
                     _f[0] = _f[0].replace(self.data_types[idx], 'hires_surface')
