@@ -29,6 +29,7 @@ from matplotlib.patches import Rectangle
 import gdal
 import fiona
 import rasterio
+from rasterio.enums import Resampling
 from sklearn.metrics import classification_report
 
 #BFGN relies on an old version of tensorflow that results in various
@@ -143,6 +144,34 @@ class Utils():
                 do_the_work()
         else:
             do_the_work()
+
+
+    @classmethod
+    def resample_raster(cls, in_file, out_file, scale_factor):
+        """
+        Resample a raster, changing the height and width by scale_factor. Written
+        for up-sampling NDVI from 2m resolution to 1m pixel size, to match high-
+        resolution DSM.
+        """
+
+        with rasterio.open(in_file) as src:
+
+            new_height = int(src.height * scale_factor)
+            new_width = int(src.width * scale_factor)
+
+            # resample data to target shape
+            data = src.read(out_shape=(new_height, new_width), resampling=Resampling.bilinear)
+
+            # scale image transform
+            transform = src.transform * src.transform.scale((src.width / data.shape[-1]),\
+                                                        (src.height / data.shape[-2]))
+            #update metadata
+            profile = src.profile
+            profile.update(transform=transform, driver='GTiff', height=new_height,\
+                           width=new_width, crs=src.crs)
+
+        with rasterio.open(out_file, 'w', **profile) as dst:
+            dst.write(data)
 
 
     def tif_to_array(self, tif, get_first_only=False):
