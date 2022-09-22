@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-09-13
+#REM 2022-09-21
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -147,31 +147,40 @@ class Utils():
 
 
     @classmethod
-    def resample_raster(cls, in_file, out_file, scale_factor):
+    def resample_raster(cls, in_file, out_file, scale_factor, replace_existing=False):
         """
         Resample a raster, changing the height and width by scale_factor. Written
         for up-sampling NDVI from 2m resolution to 1m pixel size, to match high-
         resolution DSM.
         """
 
-        with rasterio.open(in_file) as src:
+        def do_the_work():
+            with rasterio.open(in_file) as src:
 
-            new_height = int(src.height * scale_factor)
-            new_width = int(src.width * scale_factor)
+                new_height = int(src.height * scale_factor)
+                new_width = int(src.width * scale_factor)
 
-            # resample data to target shape
-            data = src.read(out_shape=(new_height, new_width), resampling=Resampling.bilinear)
+                # resample data to target shape
+                data = src.read(out_shape=(new_height, new_width), resampling=Resampling.bilinear)
 
-            # scale image transform
-            transform = src.transform * src.transform.scale((src.width / data.shape[-1]),\
-                                                        (src.height / data.shape[-2]))
-            #update metadata
-            profile = src.profile
-            profile.update(transform=transform, driver='GTiff', height=new_height,\
-                           width=new_width, crs=src.crs)
+                # scale image transform
+                transform = src.transform * src.transform.scale((src.width / data.shape[-1]),\
+                                                            (src.height / data.shape[-2]))
+                #update metadata
+                profile = src.profile
+                profile.update(transform=transform, driver='GTiff', height=new_height,\
+                               width=new_width, crs=src.crs)
 
-        with rasterio.open(out_file, 'w', **profile) as dst:
-            dst.write(data)
+            with rasterio.open(out_file, 'w', **profile) as dst:
+                dst.write(data)
+
+        if not replace_existing:
+            if os.path.isfile(out_file):
+                print(f"{out_file} already exists, not recreating")
+            else:
+                do_the_work()
+        else:
+            do_the_work()
 
 
     def tif_to_array(self, tif, get_first_only=False):
@@ -354,7 +363,8 @@ class AppliedModel():
         pass
 
 
-    def apply_model(self, config_file, application_file, outfile, move_to, method='threshold'):
+    def apply_model(self, config_file, application_file, outfile, move_to,\
+                    method='threshold', ndvi_threshold=None, ndvi_file=None):
         """
         Apply an existing model to a new area, convert probabilities to binary classes,
         and write to some sensible storage location. This method is intended to be used to
@@ -362,6 +372,8 @@ class AppliedModel():
         files are so large that they should really be created individually and only when
         really needed, and immediately moved from Agave to gdcsdata.
         """
+
+        os.makedirs(move_to, exist_ok=True)
 
         config = configs.create_config_from_file(config_file)
         data_container = data_core.DataContainer(config)
@@ -381,11 +393,23 @@ class AppliedModel():
         applied_model = utils.tif_to_array(outfile+'.tif')
 
         print(' -- getting binary classes')
-        self.probabilities_to_classes(method, applied_model, tif_template=outfile+'.tif')
+        classes = self.probabilities_to_classes(method, applied_model,\
+                                                tif_template=outfile+'.tif')
+
+        if ndvi_threshold and ndvi_file:
+            print(' -- applying NDVI threshold')
+            with rasterio.open(ndvi_file, 'r') as f:
+                meta = f.meta.copy()
+                ndvi = f.read()
+            classes = np.expand_dims(classes, 0).astype(np.float32)
+            classes[ndvi > ndvi_threshold] = 0
+            with rasterio.open(f"{outfile.replace('applied', 'ndvi_cut')}.tif", 'w', **meta) as f:
+                f.write(classes)
+            shutil.copy2(f"{outfile.replace('applied', 'ndvi_cut')}.tif", move_to)
+            os.remove(f"{outfile.replace('applied', 'ndvi_cut')}.tif")
 
         #this has to happen in a separate step as writing directly to gdcsdata in
         #apply_model_to_data step is a recipe for incomplete, corrupted files.
-        os.makedirs(move_to, exist_ok=True)
         for string in ['*', 'applied']:
             print(f' -- moving {outfile.replace(string, method)}')
             shutil.copy2(f"{outfile.replace(string, method)}.tif", move_to)
@@ -548,7 +572,7 @@ class Loops(Utils, AppliedModel):
    #pylint: disable=no-member
 
     def __init__(self, application_data, iteration_data):
-        self.data_types = None #optionally contained in iteration_data
+        self.data_types = [] #optionally filled in in iteration_data
         for key in application_data:
             setattr(self, key, application_data[key])
         for key in iteration_data:
@@ -621,7 +645,7 @@ class Loops(Utils, AppliedModel):
 
                 #find the type of input data used and update application filename to match
                 #BFGN needs application data with same number of bands as model training data
-                if self.data_types is not None:
+                if len(self.data_types) > 0:
                     if self.data_types[idx] in self.parameter_combos[idx][1][0][0]:
                         _f[0] = _f[0].replace('hires_surface', self.data_types[idx])
                         print('Changing filename', _f[0])
@@ -642,7 +666,7 @@ class Loops(Utils, AppliedModel):
                 stats.append(self.performance_metrics(applied_model, self.app_responses[i],\
                                                 self.app_boundaries[i]))
 
-                if self.data_types is not None:
+                if len(self.data_types) > 0:
                     _f[0] = _f[0].replace(self.data_types[idx], 'hires_surface')
 
         #store the performance stats (if any) for later use
