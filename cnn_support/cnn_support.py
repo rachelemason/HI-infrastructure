@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-09-21
+#REM 2022-09-23
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -73,6 +73,25 @@ class Utils():
     def __init__(self):
         pass
 
+    @classmethod
+    def count_buildings(cls, path, available_training_sets):
+        """
+        Count and print the number of polygons (which are generally buildings)
+        in each shapefile in available_training_data. Also print the number of
+        polygons/buildings in the entire training set.
+        """
+        #TODO: consider making available_training_sets a class attribute
+        count = 0
+        for nickname, shpfile in available_training_sets.items():
+            if 'HBLower' not in shpfile: #avoid double-counting overlap with HBMain
+                try:
+                    geom = fiona.open(path+shpfile+'_responses.shp')
+                    print(f"{nickname} contains {len(geom)} features")
+                    count += len(geom)
+                except: #error is CPLE_OpenFailedError but that isn't defined
+                    print(f"Can't find {path}{shpfile}_responses.shp")
+        print(f'Total number of features = {count}')
+
 
     def input_files_from_config(self, config_file, print_files=True):
         """
@@ -86,8 +105,11 @@ class Utils():
             for line in f:
                 for kind in ['feature_files:', 'response_files:', 'boundary_files:']:
                     if kind in line:
+                        print('here')
                         line = line.replace(kind, '').strip()
+                        print('here too', line)
                         files = ast.literal_eval(line)
+                        print('and here')
                         filedict[kind] = files
                         if print_files:
                             print(f'{kind} {files}')
@@ -278,6 +300,26 @@ class TrainingData(Utils):
         Utils.__init__(self)
 
 
+    @classmethod
+    def create_training_lists(cls, path, available_training_sets, desired_training_set):
+        """
+        Return a properly-formatted list of lists of training data, based on the available
+        training data and the desired subset.
+        """
+
+        parameter_combos = []
+        for train in desired_training_set:
+            boundaries = [f'{path}{available_training_sets[item]}_boundary.shp' for item in train]
+            features = []
+            responses = []
+            for item in train:
+                features.append([f'{path}{available_training_sets[item]}_hires_surface.tif'])
+                responses.append([f'{path}{available_training_sets[item]}_responses.tif'])
+            parameter_combos.append([boundaries, features, responses])
+
+        return parameter_combos
+
+
     def show_input_data(self, feature_file, response_file, boundary_file, hillshade=True):
         """
         Creates a 2-panel plot to show (1) the whole 'training canvas'; the area containing the
@@ -397,16 +439,8 @@ class AppliedModel():
                                                 tif_template=outfile+'.tif')
 
         if ndvi_threshold and ndvi_file:
-            print(' -- applying NDVI threshold')
-            with rasterio.open(ndvi_file, 'r') as f:
-                meta = f.meta.copy()
-                ndvi = f.read()
-            classes = np.expand_dims(classes, 0).astype(np.float32)
-            classes[ndvi > ndvi_threshold] = 0
-            with rasterio.open(f"{outfile.replace('applied', 'ndvi_cut')}.tif", 'w', **meta) as f:
-                f.write(classes)
-            shutil.copy2(f"{outfile.replace('applied', 'ndvi_cut')}.tif", move_to)
-            os.remove(f"{outfile.replace('applied', 'ndvi_cut')}.tif")
+            self.apply_ndvi_threshold(classes, ndvi_file, ndvi_threshold, outfile,\
+                                     move_to)
 
         #this has to happen in a separate step as writing directly to gdcsdata in
         #apply_model_to_data step is a recipe for incomplete, corrupted files.
@@ -414,6 +448,31 @@ class AppliedModel():
             print(f' -- moving {outfile.replace(string, method)}')
             shutil.copy2(f"{outfile.replace(string, method)}.tif", move_to)
             os.remove(f"{outfile.replace(string, method)}.tif")
+
+
+    @classmethod
+    def apply_ndvi_threshold(cls, classes, ndvi_file, ndvi_threshold, outfile, move_to=None):
+        """
+        Apply an NDVI cut to a model array that contains binary classes. Finds the NDVI
+        value in <ndvi_file> for each model pixel, and if it exceeds <ndvi_threshold>,
+        the class is changed from 1 to 0. This was written to exclude trees that were
+        incorrectly identified as buildings.
+        """
+
+        print(' -- applying NDVI threshold')
+
+        with rasterio.open(ndvi_file, 'r') as f:
+            meta = f.meta.copy()
+            ndvi = f.read()
+        cut_classes = np.expand_dims(classes, 0).astype(np.float32)
+        cut_classes[ndvi > ndvi_threshold] = 0
+        with rasterio.open(f"{outfile.replace('applied', 'ndvi_cut')}.tif", 'w', **meta) as f:
+            f.write(cut_classes)
+        if move_to is not None:
+            shutil.copy2(f"{outfile.replace('applied', 'ndvi_cut')}.tif", move_to)
+            os.remove(f"{outfile.replace('applied', 'ndvi_cut')}.tif")
+
+        return cut_classes
 
 
     def probabilities_to_classes(self, method, applied_model_arr, threshold_val=0.9,\
@@ -452,7 +511,6 @@ class AppliedModel():
         arr = np.expand_dims(arr, 0).astype(np.float32)
         meta.update({'count': 1})
         name = template.replace('applied', method)
-        print(name)
         with rasterio.open(name, 'w', **meta) as f:
             f.write(arr)
 
@@ -709,7 +767,6 @@ class Loops(Utils, AppliedModel):
         #Loop over the parameter combos, fit and/or apply model
         all_stats = []
         for idx, params in enumerate(self.parameter_combos):
-
             #get the current set of parameters
             combo_dict = {}
             for i, j in enumerate(params):
@@ -718,9 +775,8 @@ class Loops(Utils, AppliedModel):
 
             print('\n===================================================')
             print(f'Working on parameter combination #{idx}:\n')
-            for key, value in combo_dict.items():
-                print(f'{key}: {value}')
-
+            #for key, value in combo_dict.items():
+            #    print(f'{key}: {value}')
             #create a new settings file with these parameters
             self._create_settings_file(combo_dict, idx)
 
@@ -850,7 +906,7 @@ class Loops(Utils, AppliedModel):
         data set; one subplot for each of the files to which the model output was applied.
         """
 
-        fig, _ = plt.subplots(2, 4, figsize=(16, 10))
+        fig, _ = plt.subplots(3, 4, figsize=(16, 12))
 
         for (j, _), ax in zip(enumerate(self.app_outnames), fig.axes):
             if self.app_types[j] == 'neighbour':
