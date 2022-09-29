@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-09-23
+#REM 2022-09-28
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -864,7 +864,7 @@ class Loops(Utils, AppliedModel):
 
         _, ax = plt.subplots(figsize=(20, 20))
         img = ax.imshow(self.stats_array, vmin=0, vmax=1, cmap='hot')
-        _ = plt.colorbar(img, shrink=0.55)
+        _ = plt.colorbar(img, shrink=0.765, pad=0.01, aspect=40)
 
         #add labels to the plot
         #the basic x labels - metrics used
@@ -876,13 +876,13 @@ class Loops(Utils, AppliedModel):
         else:
             ylabels = self.parameter_combos
 
-        _ = ax.set_xticks(np.arange(len(xlabels)), labels=xlabels)
+        _ = ax.set_xticks(np.arange(len(xlabels)), labels=xlabels, rotation=45)
         _ = ax.set_yticks(np.arange(len(ylabels)), labels=ylabels)
 
         #add labels for the test regions the stats refer to
         test_regions = [a.split('_model_')[1] for a in self.app_outnames]
         for n, region in enumerate(test_regions):
-            ax.text(n*3+1, -1, f'Model applied to {region}', ha='center')
+            ax.text(n*3+1, -1, f'Model applied to\n {region}', ha='center')
 
         #add vertical lines to distinguish/delineate the test regions
         for i in range(len(self.app_outnames)):
@@ -912,7 +912,7 @@ class Loops(Utils, AppliedModel):
             if self.app_types[j] == 'neighbour':
                 colours = ['lightblue', 'blue', 'black']
             else:
-                colours = ['limegreen', 'green', 'darkgreen']
+                colours = ['blueviolet', 'magenta', 'lightpink']
 
             precision = []
             recall =[]
@@ -921,25 +921,31 @@ class Loops(Utils, AppliedModel):
                 precision.append(self.stats_array[i, j*3])
                 recall.append(self.stats_array[i, j*3+1])
                 f_1.append(self.stats_array[i, j*3+2])
-            ax.plot(range(len(precision)), precision, color=colours[0], marker='o',\
-                        ls='-.', label='Precision')
             ax.plot(range(len(recall)), recall, color=colours[1], marker='^',\
                         ls=':', label='Recall')
             ax.plot(range(len(f_1)), f_1, color=colours[2], marker='s', ls='-',\
                         label='F1 score')
+            ax.plot(range(len(precision)), precision, color=colours[0], marker='o',\
+                        ls='-.', label='Precision')
+            if 'HOVE1' in self.nicknames:
+                ax.axvline(x=3.5, color='0.5', ls='--')
             if j == 0:
                 ax.legend(loc='lower right')
                 ax.set_ylabel('Precision/Recall/F1-score')
 
             _ = ax.set_xticks(np.arange(len(self.nicknames)), labels=self.nicknames,\
                              rotation=45, ha='right')
-            ax.set_xlabel('Model training dataset(s)')
+            ax.set_xlabel('Model training dataset')
 
             ax.set_ylim([0, 1])
 
             title = self.app_outnames[j]
             title = title.split('_')[-1]
             ax.set_title(f'Model applied to {title}')
+   
+        for idx, ax in enumerate(fig.axes):
+            if idx >= len(self.app_outnames):
+                ax.axis('off')
 
         plt.tight_layout()
 
