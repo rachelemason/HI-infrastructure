@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-09-28
+#REM 2022-09-30
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -169,7 +169,8 @@ class Utils():
 
 
     @classmethod
-    def resample_raster(cls, in_file, out_file, scale_factor, replace_existing=False):
+    def resample_raster(cls, in_file, out_file, template_file, scale_factor=None,\
+                        replace_existing=False):
         """
         Resample a raster, changing the height and width by scale_factor. Written
         for up-sampling NDVI from 2m resolution to 1m pixel size, to match high-
@@ -179,9 +180,14 @@ class Utils():
         def do_the_work():
             with rasterio.open(in_file) as src:
 
-                new_height = int(src.height * scale_factor)
-                new_width = int(src.width * scale_factor)
-
+                if scale_factor:
+                    new_height = int(src.height * scale_factor)
+                    new_width = int(src.width * scale_factor)
+                else:
+                    with rasterio.open(template_file) as template:
+                        new_height = template.height
+                        new_width = template.width
+                        
                 # resample data to target shape
                 data = src.read(out_shape=(new_height, new_width), resampling=Resampling.bilinear)
 
@@ -451,7 +457,7 @@ class AppliedModel():
 
 
     @classmethod
-    def apply_ndvi_threshold(cls, classes, ndvi_file, ndvi_threshold, outfile, move_to=None):
+    def apply_ndvi_threshold(cls, classes, ndvi_file, ndvi_threshold, outfile=None, move_to=None):
         """
         Apply an NDVI cut to a model array that contains binary classes. Finds the NDVI
         value in <ndvi_file> for each model pixel, and if it exceeds <ndvi_threshold>,
@@ -466,8 +472,9 @@ class AppliedModel():
             ndvi = f.read()
         cut_classes = np.expand_dims(classes, 0).astype(np.float32)
         cut_classes[ndvi > ndvi_threshold] = 0
-        with rasterio.open(f"{outfile.replace('applied', 'ndvi_cut')}.tif", 'w', **meta) as f:
-            f.write(cut_classes)
+        if outfile is not None:
+            with rasterio.open(f"{outfile.replace('applied', 'ndvi_cut')}.tif", 'w', **meta) as f:
+                f.write(cut_classes)
         if move_to is not None:
             shutil.copy2(f"{outfile.replace('applied', 'ndvi_cut')}.tif", move_to)
             os.remove(f"{outfile.replace('applied', 'ndvi_cut')}.tif")
@@ -515,8 +522,8 @@ class AppliedModel():
             f.write(arr)
 
 
-    def show_applied_model(self, applied_model, original_img, zoom, responses=None, hillshade=True,\
-                          threshold=0.90, filename=None):
+    def show_applied_model(self, applied_model, original_img, zoom, ax2_data, responses=None, hillshade=True,\
+                          filename=None):
         """
         Plots the applied model created by
         bfgn.data_management.apply_model_to_data.apply_model_to_site, converted to a numpy array by
@@ -538,18 +545,16 @@ class AppliedModel():
         if responses is not None:
             ax1.imshow(shape, alpha=0.7, cmap='Reds_r')
 
+        #Convert probability map into binary classes using threshold
+        ax2.imshow(ax2_data, cmap='Greys')
+        if responses is not None:
+            ax2.imshow(shape, alpha=0.7, cmap='viridis_r')
         #Show the area to be zoomed into
-        ax1.add_patch(Rectangle((zoom[2], zoom[0]), zoom[3]-zoom[2], zoom[1]-zoom[0],\
+        ax2.add_patch(Rectangle((zoom[2], zoom[0]), zoom[3]-zoom[2], zoom[1]-zoom[0],\
                                fill=False, edgecolor='r'))
 
-        #Convert probability map into binary classes using threshold
-        classes = self.probabilities_to_classes('threshold', applied_model, threshold)
-        ax2.imshow(classes, cmap='Greys')
-        if responses is not None:
-            ax2.imshow(shape, alpha=0.7, cmap='Reds_r')
-
         #Zoom into the specified subregion
-        ax3.imshow(classes[zoom[0]:zoom[1], zoom[2]:zoom[3]], cmap='Greys')
+        ax3.imshow(ax2_data[zoom[0]:zoom[1], zoom[2]:zoom[3]], cmap='Greys')
         #Overplot responses (buildings), if available
         if responses is not None:
             ax3.imshow(shape[zoom[0]:zoom[1], zoom[2]:zoom[3]], alpha=0.8, cmap='viridis_r')
@@ -558,7 +563,6 @@ class AppliedModel():
         #only show the first band if there are >1)
         utils = Utils()
         original = utils.tif_to_array(original_img, get_first_only=True)
-        #original[original < 0.5] = np.nan #TODO: what was this for?
         original = original[zoom[0]:zoom[1], zoom[2]:zoom[3]]
 
         if hillshade:
@@ -590,14 +594,11 @@ class AppliedModel():
                 print(f'{key}    {np.round(vals, 2)}')
 
 
-    def performance_metrics(self, applied_model, responses, boundary_file):
+    def performance_metrics(self, classes, responses, boundary_file):
         """
-        Given a model prediction array and a set of responses, calculate precision,
+        Given a model class prediction array and a set of responses, calculate precision,
         recall, and f1-score for each class (currently assumes binary classes)
         """
-
-        # convert class probabilities to actual classes
-        classes = self.probabilities_to_classes('ML', applied_model)
 
         # create an array of the same shape as the applied model 'canvas'
         # in which everything outside the training dataset boundary/boundaries is NaN
@@ -615,7 +616,6 @@ class AppliedModel():
         expected = list(expected[~(np.isnan(expected))])
 
         # get performance metrics
-        print('Calculating metrics...')
         stats = classification_report(expected, predicted, output_dict=True)
 
         return stats
@@ -686,7 +686,7 @@ class Loops(Utils, AppliedModel):
         return experiment, data_container
 
 
-    def _apply_model(self, idx, outdir, threshold=0.90):
+    def _apply_model(self, idx, outdir, threshold=0.90, ndvi_threshold=0.5):
         """
         Helper method for self.loop_over_configs. Apply an existing trained model
         to data (test fields), write image files, and return performance metrics.
@@ -697,7 +697,9 @@ class Loops(Utils, AppliedModel):
                                                               fit_model=False, outdir=outdir)
 
         #for each test region, apply the model and get stats
-        stats = []
+        ml_stats = []
+        threshold_stats = []
+        cut_stats = []
         with io.capture_output():
             for i, _f in enumerate(self.app_features):
 
@@ -712,29 +714,47 @@ class Loops(Utils, AppliedModel):
                                                             _f, outdir+self.app_outnames[i])
 
                 applied_model = self.tif_to_array(outdir+self.app_outnames[i]+'.tif')
+                
+                #convert probabilities to binary classes by both thresholding and
+                #maximum likeihood
+                ml_classes = self.probabilities_to_classes('ML', applied_model,\
+                                                                  threshold_val=threshold)
+                threshold_classes = self.probabilities_to_classes('threshold', applied_model,\
+                                                                  threshold_val=threshold)
+                
+                #apply NDVI threshold to thresholded classes
+                ndvi_file = _f[0].replace('hires_surface', 'ndvi_hires')
+                cut_classes = self.apply_ndvi_threshold(threshold_classes, ndvi_file, ndvi_threshold)
 
-                #make pdf showing applied model; record stats
+                #make pdf showing applied model
                 hillshade = bool('res_surface' in _f[0])
                 self.show_applied_model(applied_model, zoom=self.zooms[i],\
                                                 original_img=_f[0], hillshade=hillshade,\
                                                 responses=self.app_responses[i],\
-                                                threshold=threshold,\
+                                                ax2_data = cut_classes[0],\
                                                 filename=f"{outdir}{self.app_outnames[i]}.pdf")
 
-                stats.append(self.performance_metrics(applied_model, self.app_responses[i],\
+                #record stats for ML thresholded and NDVI-cut models
+                ml_stats.append(self.performance_metrics(ml_classes, self.app_responses[i],\
+                                                self.app_boundaries[i]))
+                threshold_stats.append(self.performance_metrics(threshold_classes, self.app_responses[i],\
+                                                self.app_boundaries[i]))
+                cut_stats.append(self.performance_metrics(cut_classes, self.app_responses[i],\
                                                 self.app_boundaries[i]))
 
                 if len(self.data_types) > 0:
                     _f[0] = _f[0].replace(self.data_types[idx], 'hires_surface')
-
+                    
         #store the performance stats (if any) for later use
-        with open(f'{outdir}stats.json', 'w', encoding='utf-8') as f:
-            json.dump(stats, f)
+        for arr, name in zip([ml_stats, threshold_stats, cut_stats],\
+                             ['stats_ML', 'stats_threshold', 'stats_cut']):
+            with open(f'{outdir}{name}.json', 'w', encoding='utf-8') as f:
+                json.dump(arr, f)
 
-        return stats
+        return ml_stats, threshold_stats, cut_stats
 
 
-    def _create_stats_array(self, stats):
+    def _create_stats_arrays(self, stats):
         """
         Helper method for self.loop_over_configs. Convert big unwieldy list of
         performance metrics created by self.loop_over_configs to self.stats_array
@@ -742,15 +762,17 @@ class Loops(Utils, AppliedModel):
         """
 
         #Array to hold the performance metrics
-        self.stats_array = np.zeros((len(self.parameter_combos),\
+        stats_array = np.zeros((len(self.parameter_combos),\
                                      len(self.app_features)*3)) #3 is for the 3 metrics
 
         for i, _ in enumerate(stats):
             for idx, data in enumerate(stats[i]):
                 #stats for class '1.0' (buildings)
-                self.stats_array[i, idx*3] = np.round(data['1.0']['precision'], 2)
-                self.stats_array[i, idx*3+1] = np.round(data['1.0']['recall'], 2)
-                self.stats_array[i, idx*3+2] = np.round(data['1.0']['f1-score'], 2)
+                stats_array[i, idx*3] = np.round(data['1.0']['precision'], 2)
+                stats_array[i, idx*3+1] = np.round(data['1.0']['recall'], 2)
+                stats_array[i, idx*3+2] = np.round(data['1.0']['f1-score'], 2)
+                
+        return stats_array
 
 
     def loop_over_configs(self, rebuild_data=False, fit_model=True, apply_model=True,\
@@ -765,7 +787,9 @@ class Loops(Utils, AppliedModel):
         """
 
         #Loop over the parameter combos, fit and/or apply model
-        all_stats = []
+        ml_stats = []
+        threshold_stats = []
+        cut_stats = []
         for idx, params in enumerate(self.parameter_combos):
             #get the current set of parameters
             combo_dict = {}
@@ -801,24 +825,32 @@ class Loops(Utils, AppliedModel):
             if apply_model:
                 if use_existing:
                     try:
-                        with open(f'{outdir}stats.json', 'r', encoding='utf-8') as f:
-                            stats = json.load(f)
+                        with open(f'{outdir}stats_ML.json', 'r', encoding='utf-8') as f:
+                            stats0 = json.load(f)
+                        with open(f'{outdir}stats_threshold.json', 'r', encoding='utf-8') as f:
+                            stats1 = json.load(f)
+                        with open(f'{outdir}stats_cut.json', 'r', encoding='utf-8') as f:
+                            stats2 = json.load(f)
                         print(f'Loaded stats for {outdir} from file')
                     except FileNotFoundError:
                         print(f'Saved stats not found in {outdir}; applying model')
-                        stats = self._apply_model(idx, outdir, threshold)
+                        stats0, stats1, stats2 = self._apply_model(idx, outdir, threshold)
                         plt.close('all')
                 else:
-                    stats = self._apply_model(idx, outdir, threshold)
+                    stats0, stats1, stats2 = self._apply_model(idx, outdir, threshold)
                     plt.close('all')
-                all_stats.append(stats)
+                ml_stats.append(stats0)
+                threshold_stats.append(stats1)
+                cut_stats.append(stats2)
 
             #Archive the settings file for this parameter combo
             shutil.move(f'new_settings_{idx}.yaml', f'{outdir}new_settings_{idx}.yaml')
 
         #Once all stats have been gathered, reformat nicely
         if apply_model:
-            self._create_stats_array(all_stats)
+            self.ml_stats = self._create_stats_arrays(ml_stats)
+            self.threshold_stats = self._create_stats_arrays(threshold_stats)
+            self.cut_stats = self._create_stats_arrays(cut_stats)
 
 
     def _create_settings_file(self, combo_dict, num):
@@ -900,12 +932,21 @@ class Loops(Utils, AppliedModel):
         plt.savefig(self.out_path+'heatmap.png', dpi=400)
 
 
-    def results_by_training_data(self):
+    def results_by_training_data(self, stats_type):
         """
         Creates plots that show performance metrics as a function of training
         data set; one subplot for each of the files to which the model output was applied.
         """
 
+        if stats_type == 'ML':
+            to_plot = self.ml_stats
+        elif stats_type == 'threshold':
+            to_plot = self.threshold_stats
+        elif stats_type == 'cut':
+            to_plot = self.cut_stats
+        else:
+            print ('Value of stats_type must be one of ML|threshold|cut')
+        
         fig, _ = plt.subplots(3, 4, figsize=(16, 12))
 
         for (j, _), ax in zip(enumerate(self.app_outnames), fig.axes):
@@ -917,10 +958,10 @@ class Loops(Utils, AppliedModel):
             precision = []
             recall =[]
             f_1 = []
-            for i in range(self.stats_array.shape[0]):
-                precision.append(self.stats_array[i, j*3])
-                recall.append(self.stats_array[i, j*3+1])
-                f_1.append(self.stats_array[i, j*3+2])
+            for i in range(to_plot.shape[0]):
+                precision.append(to_plot[i, j*3])
+                recall.append(to_plot[i, j*3+1])
+                f_1.append(to_plot[i, j*3+2])
             ax.plot(range(len(recall)), recall, color=colours[1], marker='^',\
                         ls=':', label='Recall')
             ax.plot(range(len(f_1)), f_1, color=colours[2], marker='s', ls='-',\
@@ -949,7 +990,7 @@ class Loops(Utils, AppliedModel):
 
         plt.tight_layout()
 
-        plt.savefig(self.out_path+'metrics_by_training_data.png', dpi=400)
+        plt.savefig(f'{self.out_path}metrics_by_training_data_{stats_type}.png', dpi=400)
 
 
 if __name__ == "__main__":
