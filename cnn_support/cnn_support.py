@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-09-30
+#REM 2022-10-05
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -307,7 +307,7 @@ class TrainingData(Utils):
 
 
     @classmethod
-    def create_training_lists(cls, path, available_training_sets, desired_training_set):
+    def create_training_lists(cls, paths, available_training_sets, desired_training_set):
         """
         Return a properly-formatted list of lists of training data, based on the available
         training data and the desired subset.
@@ -315,12 +315,12 @@ class TrainingData(Utils):
 
         parameter_combos = []
         for train in desired_training_set:
-            boundaries = [f'{path}{available_training_sets[item]}_boundary.shp' for item in train]
+            boundaries = [f"{paths['boundary']}{available_training_sets[item]}_boundary.shp" for item in train]
             features = []
             responses = []
             for item in train:
-                features.append([f'{path}{available_training_sets[item]}_hires_surface.tif'])
-                responses.append([f'{path}{available_training_sets[item]}_responses.tif'])
+                features.append([f"{paths['features']}{available_training_sets[item]}_hires_surface.tif"])
+                responses.append([f"{paths['responses']}{available_training_sets[item]}_responses.tif"])
             parameter_combos.append([boundaries, features, responses])
 
         return parameter_combos
@@ -548,7 +548,7 @@ class AppliedModel():
         #Convert probability map into binary classes using threshold
         ax2.imshow(ax2_data, cmap='Greys')
         if responses is not None:
-            ax2.imshow(shape, alpha=0.7, cmap='viridis_r')
+            ax2.imshow(shape, alpha=0.7, cmap='Reds_r')
         #Show the area to be zoomed into
         ax2.add_patch(Rectangle((zoom[2], zoom[0]), zoom[3]-zoom[2], zoom[1]-zoom[0],\
                                fill=False, edgecolor='r'))
@@ -557,7 +557,7 @@ class AppliedModel():
         ax3.imshow(ax2_data[zoom[0]:zoom[1], zoom[2]:zoom[3]], cmap='Greys')
         #Overplot responses (buildings), if available
         if responses is not None:
-            ax3.imshow(shape[zoom[0]:zoom[1], zoom[2]:zoom[3]], alpha=0.8, cmap='viridis_r')
+            ax3.imshow(shape[zoom[0]:zoom[1], zoom[2]:zoom[3]], alpha=0.8, cmap='Reds_r')
 
         #The original image for which everything was predicted (same subset/zoom region;
         #only show the first band if there are >1)
@@ -728,12 +728,12 @@ class Loops(Utils, AppliedModel):
 
                 #make pdf showing applied model
                 hillshade = bool('res_surface' in _f[0])
-                self.show_applied_model(applied_model, zoom=self.zooms[i],\
+                self.show_applied_model(applied_model=applied_model, zoom=self.zooms[i],\
                                                 original_img=_f[0], hillshade=hillshade,\
                                                 responses=self.app_responses[i],\
-                                                ax2_data = cut_classes[0],\
+                                                ax2_data=cut_classes[0],\
                                                 filename=f"{outdir}{self.app_outnames[i]}.pdf")
-
+                
                 #record stats for ML thresholded and NDVI-cut models
                 ml_stats.append(self.performance_metrics(ml_classes, self.app_responses[i],\
                                                 self.app_boundaries[i]))
@@ -886,16 +886,18 @@ class Loops(Utils, AppliedModel):
                 f.write(line)
 
 
-    def parameter_heatmap(self):
+    def parameter_heatmap(self, stats_type):
         """
         Plots a heatmap of precision, recall and F1 score for a set of model test regions and
         parameter combinations, using <stats_array> produced by the loop_over_configs function.
         """
 
         print(f'Parameters tested:{list(self.permutations.keys())}')
+        
+        to_plot = self._check_stats_type(stats_type)
 
         _, ax = plt.subplots(figsize=(20, 20))
-        img = ax.imshow(self.stats_array, vmin=0, vmax=1, cmap='hot')
+        img = ax.imshow(to_plot, vmin=0, vmax=1, cmap='hot')
         _ = plt.colorbar(img, shrink=0.765, pad=0.01, aspect=40)
 
         #add labels to the plot
@@ -923,19 +925,19 @@ class Loops(Utils, AppliedModel):
         #annotate the heatmap with performance metric values
         for i in range(len(ylabels)):
             for j in range(len(xlabels)):
-                if self.stats_array[i, j] >= 0.5:
+                if to_plot[i, j] >= 0.5:
                     color = 'k'
                 else:
                     color = 'w'
-                _ = ax.text(j, i, self.stats_array[i, j], ha="center", va="center", color=color)
+                _ = ax.text(j, i, to_plot[i, j], ha="center", va="center", color=color)
 
         plt.savefig(self.out_path+'heatmap.png', dpi=400)
 
-
-    def results_by_training_data(self, stats_type):
+        
+    def _check_stats_type(self, stats_type):
         """
-        Creates plots that show performance metrics as a function of training
-        data set; one subplot for each of the files to which the model output was applied.
+        Helper method for plotting functions, returns correct array to plot
+        based on stats_type parameter
         """
 
         if stats_type == 'ML':
@@ -945,7 +947,19 @@ class Loops(Utils, AppliedModel):
         elif stats_type == 'cut':
             to_plot = self.cut_stats
         else:
+            #TODO: Raise exception
             print ('Value of stats_type must be one of ML|threshold|cut')
+
+        return to_plot
+
+
+    def results_by_training_data(self, stats_type):
+        """
+        Creates plots that show performance metrics as a function of training
+        data set; one subplot for each of the files to which the model output was applied.
+        """
+
+        to_plot = self._check_stats_type(stats_type)
         
         fig, _ = plt.subplots(3, 4, figsize=(16, 12))
 
@@ -972,7 +986,7 @@ class Loops(Utils, AppliedModel):
                 ax.axvline(x=3.5, color='0.5', ls='--')
             if j == 0:
                 ax.legend(loc='lower right')
-                ax.set_ylabel('Precision/Recall/F1-score')
+                ax.set_ylabel('Recall/Precision/F1-score')
 
             _ = ax.set_xticks(np.arange(len(self.nicknames)), labels=self.nicknames,\
                              rotation=45, ha='right')
@@ -991,6 +1005,53 @@ class Loops(Utils, AppliedModel):
         plt.tight_layout()
 
         plt.savefig(f'{self.out_path}metrics_by_training_data_{stats_type}.png', dpi=400)
+        
+
+    def results_by_test_area(self, training_set_index=8, stats_type='cut'):
+        """
+        """
+        
+        to_plot = self._check_stats_type(stats_type)
+
+        _, ax = plt.subplots(1, 1, figsize=(8, 6))
+
+        #get the data out of the relevant stats array
+        metrics = {'recall': [], 'precision': [], 'f1-score': []}
+        colors = {'recall': [], 'precision': [], 'f1-score': []}
+        symbols = {'recall': '^', 'precision': 'o', 'f1-score': 's'}
+        for (j, _) in enumerate(self.app_outnames):
+            if self.app_types[j] == 'neighbour':
+                colors['recall'].append('blue')
+                colors['precision'].append('lightblue')
+                colors['f1-score'].append('black')
+            else:
+                colors['recall'].append('blueviolet')
+                colors['precision'].append('magenta')
+                colors['f1-score'].append('lightpink')
+            metrics['precision'].append(to_plot[training_set_index, j*3])
+            metrics['recall'].append(to_plot[training_set_index, j*3+1])
+            metrics['f1-score'].append(to_plot[training_set_index, j*3+2])
+
+        #set up for a legend that includes mean values of metrics
+        labels = {'recall': '', 'precision': '', 'f1-score': ''}
+        for metric, values in metrics.items():
+            labels[metric] = (f'{metric} (mean={np.round(np.mean(values), 2)})')
+
+        #plot the data + legend
+        for metric, values in metrics.items():
+            ax.scatter(range(len(values)), values, color=colors[metric],\
+                       marker=symbols[metric], s=100, label=labels[metric])
+        ax.legend(loc='lower right', fontsize=12)
+        
+        #axis stuff
+        ax.set_ylabel('Recall/Precision/F1-score', fontsize=14)
+        labels = [s.split('applied_model_')[1] for s in self.app_outnames]
+        _ = ax.set_xticks(np.arange(len(self.app_outnames)), labels=labels,\
+                             rotation=45, ha='right', fontsize=12)
+        ax.set_xlabel('Model test region', fontsize=14)
+        ax.set_ylim([0, 1])
+        
+        plt.savefig(f'{self.out_path}metrics_by_test_area_{stats_type}.png', dpi=400)
 
 
 if __name__ == "__main__":
