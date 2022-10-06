@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-10-05
+#REM 2022-10-06
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -312,15 +312,13 @@ class TrainingData(Utils):
 
         parameter_combos = []
         for train in desired_training_set:
-            boundaries = [f"{paths['boundary']}{available_training_sets[item]}\
-                          _boundary.shp" for item in train]
+            boundaries = [f"{paths['boundary']}{available_training_sets[item]}_boundary.shp"\
+                          for item in train]
             features = []
             responses = []
             for item in train:
-                features.append([f"{paths['features']}{available_training_sets[item]}\
-                                 _hires_surface.tif"])
-                responses.append([f"{paths['responses']}{available_training_sets[item]}\
-                                  _responses.tif"])
+                features.append([f"{paths['features']}{available_training_sets[item]}_hires_surface.tif"])
+                responses.append([f"{paths['responses']}{available_training_sets[item]}_responses.tif"])
             parameter_combos.append([boundaries, features, responses])
 
         return parameter_combos
@@ -411,17 +409,15 @@ class AppliedModel():
         pass
 
 
-    def apply_model(self, config_file, application_file, outfile, move_to,\
-                    method='threshold', ndvi_threshold=None, ndvi_file=None):
+    def apply_model(self, config_file, application_file, outfile, method='threshold',\
+                    ndvi_threshold=None, ndvi_file=None):
         """
         Apply an existing model to a new area, convert probabilities to binary classes,
         and write to some sensible storage location. This method is intended to be used to
         apply models to large tiles - this could be done via Loops() but the resulting
         files are so large that they should really be created individually and only when
-        really needed, and immediately moved from Agave to gdcsdata.
+        really needed
         """
-
-        os.makedirs(move_to, exist_ok=True)
 
         config = configs.create_config_from_file(config_file)
         data_container = data_core.DataContainer(config)
@@ -445,19 +441,11 @@ class AppliedModel():
                                                 tif_template=outfile+'.tif')
 
         if ndvi_threshold and ndvi_file:
-            self.apply_ndvi_threshold(classes, ndvi_file, ndvi_threshold, outfile,\
-                                     move_to)
-
-        #this has to happen in a separate step as writing directly to gdcsdata in
-        #apply_model_to_data step is a recipe for incomplete, corrupted files.
-        for string in ['*', 'applied']:
-            print(f' -- moving {outfile.replace(string, method)}')
-            shutil.copy2(f"{outfile.replace(string, method)}.tif", move_to)
-            os.remove(f"{outfile.replace(string, method)}.tif")
+            self.apply_ndvi_threshold(classes, ndvi_file, ndvi_threshold, outfile)
 
 
     @classmethod
-    def apply_ndvi_threshold(cls, classes, ndvi_file, ndvi_threshold, outfile=None, move_to=None):
+    def apply_ndvi_threshold(cls, classes, ndvi_file, ndvi_threshold, outfile=None):
         """
         Apply an NDVI cut to a model array that contains binary classes. Finds the NDVI
         value in <ndvi_file> for each model pixel, and if it exceeds <ndvi_threshold>,
@@ -475,9 +463,6 @@ class AppliedModel():
         if outfile is not None:
             with rasterio.open(f"{outfile.replace('applied', 'ndvi_cut')}.tif", 'w', **meta) as f:
                 f.write(cut_classes)
-        if move_to is not None:
-            shutil.copy2(f"{outfile.replace('applied', 'ndvi_cut')}.tif", move_to)
-            os.remove(f"{outfile.replace('applied', 'ndvi_cut')}.tif")
 
         return cut_classes
 
