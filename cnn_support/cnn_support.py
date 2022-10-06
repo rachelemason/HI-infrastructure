@@ -80,16 +80,13 @@ class Utils():
         in each shapefile in available_training_data. Also print the number of
         polygons/buildings in the entire training set.
         """
-        #TODO: consider making available_training_sets a class attribute
+
         count = 0
         for nickname, shpfile in available_training_sets.items():
             if 'HBLower' not in shpfile: #avoid double-counting overlap with HBMain
-                try:
-                    geom = fiona.open(path+shpfile+'_responses.shp')
-                    print(f"{nickname} contains {len(geom)} features")
-                    count += len(geom)
-                except: #error is CPLE_OpenFailedError but that isn't defined
-                    print(f"Can't find {path}{shpfile}_responses.shp")
+                geom = fiona.open(path+shpfile+'_responses.shp')
+                print(f"{nickname} contains {len(geom)} features")
+                count += len(geom)
         print(f'Total number of features = {count}')
 
 
@@ -187,7 +184,7 @@ class Utils():
                     with rasterio.open(template_file) as template:
                         new_height = template.height
                         new_width = template.width
-                        
+
                 # resample data to target shape
                 data = src.read(out_shape=(new_height, new_width), resampling=Resampling.bilinear)
 
@@ -315,12 +312,15 @@ class TrainingData(Utils):
 
         parameter_combos = []
         for train in desired_training_set:
-            boundaries = [f"{paths['boundary']}{available_training_sets[item]}_boundary.shp" for item in train]
+            boundaries = [f"{paths['boundary']}{available_training_sets[item]}\
+                          _boundary.shp" for item in train]
             features = []
             responses = []
             for item in train:
-                features.append([f"{paths['features']}{available_training_sets[item]}_hires_surface.tif"])
-                responses.append([f"{paths['responses']}{available_training_sets[item]}_responses.tif"])
+                features.append([f"{paths['features']}{available_training_sets[item]}\
+                                 _hires_surface.tif"])
+                responses.append([f"{paths['responses']}{available_training_sets[item]}\
+                                  _responses.tif"])
             parameter_combos.append([boundaries, features, responses])
 
         return parameter_combos
@@ -522,8 +522,8 @@ class AppliedModel():
             f.write(arr)
 
 
-    def show_applied_model(self, applied_model, original_img, zoom, ax2_data, responses=None, hillshade=True,\
-                          filename=None):
+    def show_applied_model(self, applied_model, original_img, zoom, ax2_data, responses=None,\
+                           hillshade=True, filename=None):
         """
         Plots the applied model created by
         bfgn.data_management.apply_model_to_data.apply_model_to_site, converted to a numpy array by
@@ -629,14 +629,16 @@ class Loops(Utils, AppliedModel):
    #using settatr in __init__ is nice but causes pylint to barf, so
    #pylint: disable=no-member
 
-    def __init__(self, application_data, iteration_data):
+    def __init__(self, application_data, iteration_data, settings_file):
         self.data_types = [] #optionally filled in in iteration_data
         for key in application_data:
             setattr(self, key, application_data[key])
         for key in iteration_data:
             setattr(self, key, iteration_data[key])
-        self.stats_array = None #defined in _create_stats_array()
-        self.default_out = None #defined in loop_over_configs()
+        self.settings_file = settings_file
+        self.ml_stats = None #defined in _create_stats_array()
+        self.threshold_stats = None #defined in _create_stats_array()
+        self.cut_stats = None #defined in _create_stats_array()
 
         Utils.__init__(self)
         AppliedModel.__init__(self)
@@ -714,17 +716,18 @@ class Loops(Utils, AppliedModel):
                                                             _f, outdir+self.app_outnames[i])
 
                 applied_model = self.tif_to_array(outdir+self.app_outnames[i]+'.tif')
-                
+
                 #convert probabilities to binary classes by both thresholding and
                 #maximum likeihood
                 ml_classes = self.probabilities_to_classes('ML', applied_model,\
                                                                   threshold_val=threshold)
                 threshold_classes = self.probabilities_to_classes('threshold', applied_model,\
                                                                   threshold_val=threshold)
-                
+
                 #apply NDVI threshold to thresholded classes
                 ndvi_file = _f[0].replace('hires_surface', 'ndvi_hires')
-                cut_classes = self.apply_ndvi_threshold(threshold_classes, ndvi_file, ndvi_threshold)
+                cut_classes = self.apply_ndvi_threshold(threshold_classes, ndvi_file,\
+                                                        ndvi_threshold)
 
                 #make pdf showing applied model
                 hillshade = bool('res_surface' in _f[0])
@@ -733,18 +736,19 @@ class Loops(Utils, AppliedModel):
                                                 responses=self.app_responses[i],\
                                                 ax2_data=cut_classes[0],\
                                                 filename=f"{outdir}{self.app_outnames[i]}.pdf")
-                
+
                 #record stats for ML thresholded and NDVI-cut models
                 ml_stats.append(self.performance_metrics(ml_classes, self.app_responses[i],\
                                                 self.app_boundaries[i]))
-                threshold_stats.append(self.performance_metrics(threshold_classes, self.app_responses[i],\
-                                                self.app_boundaries[i]))
+                threshold_stats.append(self.performance_metrics(threshold_classes,\
+                                                                self.app_responses[i],\
+                                                                self.app_boundaries[i]))
                 cut_stats.append(self.performance_metrics(cut_classes, self.app_responses[i],\
                                                 self.app_boundaries[i]))
 
                 if len(self.data_types) > 0:
                     _f[0] = _f[0].replace(self.data_types[idx], 'hires_surface')
-                    
+
         #store the performance stats (if any) for later use
         for arr, name in zip([ml_stats, threshold_stats, cut_stats],\
                              ['stats_ML', 'stats_threshold', 'stats_cut']):
@@ -771,7 +775,7 @@ class Loops(Utils, AppliedModel):
                 stats_array[i, idx*3] = np.round(data['1.0']['precision'], 2)
                 stats_array[i, idx*3+1] = np.round(data['1.0']['recall'], 2)
                 stats_array[i, idx*3+2] = np.round(data['1.0']['f1-score'], 2)
-                
+
         return stats_array
 
 
@@ -861,7 +865,7 @@ class Loops(Utils, AppliedModel):
         """
 
         newlines = []
-        with open('settings.yaml', 'r', encoding='utf-8') as f:
+        with open(self.settings_file, 'r', encoding='utf-8') as f:
             for line in f:
                 #identify and edit lines containing parameters to be changed
                 if any(ele in line for ele in self.permutations.keys()):
@@ -893,7 +897,7 @@ class Loops(Utils, AppliedModel):
         """
 
         print(f'Parameters tested:{list(self.permutations.keys())}')
-        
+
         to_plot = self._check_stats_type(stats_type)
 
         _, ax = plt.subplots(figsize=(20, 20))
@@ -933,7 +937,7 @@ class Loops(Utils, AppliedModel):
 
         plt.savefig(self.out_path+'heatmap.png', dpi=400)
 
-        
+
     def _check_stats_type(self, stats_type):
         """
         Helper method for plotting functions, returns correct array to plot
@@ -947,8 +951,7 @@ class Loops(Utils, AppliedModel):
         elif stats_type == 'cut':
             to_plot = self.cut_stats
         else:
-            #TODO: Raise exception
-            print ('Value of stats_type must be one of ML|threshold|cut')
+            raise ValueError('Value of stats_type must be one of ML|threshold|cut')
 
         return to_plot
 
@@ -960,7 +963,7 @@ class Loops(Utils, AppliedModel):
         """
 
         to_plot = self._check_stats_type(stats_type)
-        
+
         fig, _ = plt.subplots(3, 4, figsize=(16, 12))
 
         for (j, _), ax in zip(enumerate(self.app_outnames), fig.axes):
@@ -997,7 +1000,7 @@ class Loops(Utils, AppliedModel):
             title = self.app_outnames[j]
             title = title.split('_')[-1]
             ax.set_title(f'Model applied to {title}')
-   
+
         for idx, ax in enumerate(fig.axes):
             if idx >= len(self.app_outnames):
                 ax.axis('off')
@@ -1005,12 +1008,14 @@ class Loops(Utils, AppliedModel):
         plt.tight_layout()
 
         plt.savefig(f'{self.out_path}metrics_by_training_data_{stats_type}.png', dpi=400)
-        
+
 
     def results_by_test_area(self, training_set_index=8, stats_type='cut'):
         """
+        Create a plot that shows performance stats of a single model, fit to several labeled
+        test regions.
         """
-        
+
         to_plot = self._check_stats_type(stats_type)
 
         _, ax = plt.subplots(1, 1, figsize=(8, 6))
@@ -1042,7 +1047,7 @@ class Loops(Utils, AppliedModel):
             ax.scatter(range(len(values)), values, color=colors[metric],\
                        marker=symbols[metric], s=100, label=labels[metric])
         ax.legend(loc='lower right', fontsize=12)
-        
+
         #axis stuff
         ax.set_ylabel('Recall/Precision/F1-score', fontsize=14)
         labels = [s.split('applied_model_')[1] for s in self.app_outnames]
@@ -1050,7 +1055,7 @@ class Loops(Utils, AppliedModel):
                              rotation=45, ha='right', fontsize=12)
         ax.set_xlabel('Model test region', fontsize=14)
         ax.set_ylim([0, 1])
-        
+
         plt.savefig(f'{self.out_path}metrics_by_test_area_{stats_type}.png', dpi=400)
 
 
