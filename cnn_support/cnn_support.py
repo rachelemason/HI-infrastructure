@@ -247,6 +247,39 @@ class Utils():
         return mask
 
 
+    @classmethod
+    def create_hillshade(cls, in_file, out_file, replace_existing=False):
+        """
+        Creates a hillshaded version of in_file and writes it to out_file. Differs
+        from self.hillshade in that it takes a file as input (as opposed to array)
+        and writes to file instead of displaying a plot.
+        """
+        
+        def do_the_work():
+            
+            print(f'Hillshading {in_file}...')
+
+            with rasterio.open(in_file) as src:
+                data = src.read()[0]
+                profile = src.profile
+                
+            light = LightSource(azdeg=315, altdeg=45)
+            hillshade = light.hillshade(data)
+            
+            hillshade = np.expand_dims(hillshade, 0).astype(np.float32)
+
+            with rasterio.open(out_file, 'w', **profile) as dst:
+                dst.write(hillshade)
+            
+        if not replace_existing:
+            if os.path.isfile(out_file):
+                print(f"{out_file} already exists, not recreating")
+            else:
+                do_the_work()
+        else:
+            do_the_work()
+
+
     def hillshade(self, ax, to_plot):
         """
         Helper function for show_input_data() etc. Plots data on an axis using
