@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-10-06
+#REM 2022-10-13
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -10,7 +10,8 @@ sensing data. Contains classes to help with:
   - visualizing the applied models
   - looping over different training datasets and
     parameter combinations, and visualizing results
-Intended for use with REM's dedicated Jupyter notebooks
+Intended for use with REM's dedicated Jupyter notebooks. Requires bfgn-gpu
+environment.
 """
 
 import os
@@ -90,7 +91,8 @@ class Utils():
         print(f'Total number of features = {count}')
 
 
-    def input_files_from_config(self, config_file, print_files=True):
+    @classmethod
+    def input_files_from_config(cls, config_file, print_files=True):
         """
         Return a dictionary containing the lists of feature, response, and boundary
         files specified in <config_file>. Dictionary keys are 'feature_files',
@@ -113,8 +115,8 @@ class Utils():
 
         return filedict['feature_files:'], filedict['response_files:'], filedict['boundary_files:']
 
-
-    def rasterize(self, reference_raster, shapefile, tif_out, replace_existing):
+    @classmethod
+    def rasterize(cls, reference_raster, shapefile, tif_out, replace_existing):
         """
         Converts the .shp files in <shapefile_list> into .tif files, using
         the geometry info in <reference_raster>. Output tif files are written
@@ -142,7 +144,8 @@ class Utils():
             do_the_work()
 
 
-    def extract_raster_section(self, main_file, template, destination, replace_existing=True):
+    @classmethod
+    def extract_raster_section(cls, main_file, template, destination, replace_existing=True):
         """
         Write the subset of raster <main_file> specified by <template>
         into <destination> tif.
@@ -151,10 +154,10 @@ class Utils():
         def do_the_work():
             print(f'Extracting subset of {main_file} defined by {template}')
             geo = gdal.Open(template)
-            ulx, xres, _, uly, _, yres  = geo.GetGeoTransform()
+            ulx, xres, _, uly, _, yres = geo.GetGeoTransform()
             lrx = ulx + (geo.RasterXSize * xres)
             lry = uly + (geo.RasterYSize * yres)
-            gdal.Translate(destination, gdal.Open(main_file), projWin = [ulx, uly, lrx, lry])
+            gdal.Translate(destination, gdal.Open(main_file), projWin=[ulx, uly, lrx, lry])
 
         if not replace_existing:
             if os.path.isfile(destination):
@@ -208,7 +211,8 @@ class Utils():
             do_the_work()
 
 
-    def tif_to_array(self, tif, get_first_only=False):
+    @classmethod
+    def tif_to_array(cls, tif, get_first_only=False):
         """
         Returns contents of <tif>as a numpy array, optionally containing only the
         first band if it's a multi-band dataset. Some BFGN methods,
@@ -228,7 +232,8 @@ class Utils():
         return arr
 
 
-    def boundary_shp_to_mask(self, boundary_file, background_file):
+    @classmethod
+    def boundary_shp_to_mask(cls, boundary_file, background_file):
         """
         Return a numpy array ('mask') with the same shape as <background_file>,
         in which pixels within all polygons in <boundary_file> have values >=0,
@@ -254,23 +259,23 @@ class Utils():
         from self.hillshade in that it takes a file as input (as opposed to array)
         and writes to file instead of displaying a plot.
         """
-        
+
         def do_the_work():
-            
+
             print(f'Hillshading {in_file}...')
 
             with rasterio.open(in_file) as src:
                 data = src.read()[0]
                 profile = src.profile
-                
+
             light = LightSource(azdeg=315, altdeg=45)
             hillshade = light.hillshade(data)
-            
+
             hillshade = np.expand_dims(hillshade, 0).astype(np.float32)
 
             with rasterio.open(out_file, 'w', **profile) as dst:
                 dst.write(hillshade)
-            
+
         if not replace_existing:
             if os.path.isfile(out_file):
                 print(f"{out_file} already exists, not recreating")
@@ -280,7 +285,8 @@ class Utils():
             do_the_work()
 
 
-    def hillshade(self, ax, to_plot):
+    @classmethod
+    def hillshade(cls, ax, to_plot):
         """
         Helper function for show_input_data() etc. Plots data on an axis using
         hillshading, using default parameters for sun azimuth and altitude.
@@ -337,7 +343,7 @@ class TrainingData(Utils):
 
 
     @classmethod
-    def create_training_lists(cls, paths, available_training_sets, desired_training_set):
+    def create_training_lists(cls, paths, available_training_sets, desired_training_set, lo_res=False):
         """
         Return a properly-formatted list of lists of training data, based on the available
         training data and the desired subset.
@@ -351,7 +357,10 @@ class TrainingData(Utils):
             responses = []
             for item in train:
                 features.append([f"{paths['features']}{available_training_sets[item]}_hires_surface.tif"])
-                responses.append([f"{paths['responses']}{available_training_sets[item]}_responses.tif"])
+                if not lo_res:
+                    responses.append([f"{paths['responses']}{available_training_sets[item]}_responses.tif"])
+                else:
+                    responses.append([f"{paths['responses']}{available_training_sets[item]}_lores_responses.tif"])
             parameter_combos.append([boundaries, features, responses])
 
         return parameter_combos
@@ -388,7 +397,8 @@ class TrainingData(Utils):
         plt.tight_layout()
 
 
-    def plot_training_data(self, features, responses, images_to_plot=3, feature_band=0,\
+    @classmethod
+    def plot_training_data(cls, features, responses, images_to_plot=3, feature_band=0,\
                            nodata_value=-9999):
         """ Tool to plot the training and response data data side by side. Adapted from
             the ecoCNN code.
@@ -408,28 +418,28 @@ class TrainingData(Utils):
         features[features == nodata_value] = np.nan
         responses[responses == nodata_value] = np.nan
 
-        feat_nan = np.squeeze(np.isnan(features[:,:,:,0]))
-        features[feat_nan,:] = np.nan
+        feat_nan = np.squeeze(np.isnan(features[:, :, :, 0]))
+        features[feat_nan, :] = np.nan
 
-        _ = plt.figure(figsize=(4,images_to_plot*2))
+        _ = plt.figure(figsize=(4, images_to_plot*2))
         gs1 = gridspec.GridSpec(images_to_plot, 2)
         for n in range(0, images_to_plot):
-            _ = plt.subplot(gs1[n,0])
+            _ = plt.subplot(gs1[n, 0])
 
-            feat_min = np.nanmin(features[n,:,:,feature_band])
-            feat_max = np.nanmax(features[n,:,:,feature_band])
+            feat_min = np.nanmin(features[n, :, :, feature_band])
+            feat_max = np.nanmax(features[n, :, :, feature_band])
 
-            plt.imshow(features[n,:,:,feature_band], vmin=feat_min, vmax=feat_max)
+            plt.imshow(features[n, :, :, feature_band], vmin=feat_min, vmax=feat_max)
             plt.xticks([])
             plt.yticks([])
             if n == 0:
                 plt.title('Feature')
 
-            _ = plt.subplot(gs1[n,1])
-            plt.imshow(responses[n,:,:,0], vmin=0, vmax=1)
+            _ = plt.subplot(gs1[n, 1])
+            plt.imshow(responses[n, :, :, 0], vmin=0, vmax=1)
             plt.xticks([])
             plt.yticks([])
-            if n==0:
+            if n == 0:
                 plt.title('Response')
 
 
@@ -487,7 +497,7 @@ class AppliedModel():
         """
 
         print(' -- applying NDVI threshold')
-
+        print(ndvi_file)
         with rasterio.open(ndvi_file, 'r') as f:
             meta = f.meta.copy()
             ndvi = f.read()
@@ -540,7 +550,8 @@ class AppliedModel():
             f.write(arr)
 
 
-    def show_applied_model(self, applied_model, original_img, zoom, ax2_data, responses=None,\
+    @classmethod
+    def show_applied_model(cls, applied_model, original_img, zoom, ax2_data, responses=None,\
                            hillshade=True, filename=None):
         """
         Plots the applied model created by
@@ -606,13 +617,14 @@ class AppliedModel():
         for key, vals in statsdict.items():
             try:
                 vals = [np.round(v, 2) for v in vals.values()]
-                spc =  ' ' * (18-len(key))
+                spc = ' ' * (18-len(key))
                 print(f'{key}{spc}{vals[0]}      {vals[1]}      {vals[2]}      {vals[3]}')
             except AttributeError:
                 print(f'{key}    {np.round(vals, 2)}')
 
 
-    def performance_metrics(self, classes, responses, boundary_file):
+    @classmethod
+    def performance_metrics(cls, classes, responses, boundary_file):
         """
         Given a model class prediction array and a set of responses, calculate precision,
         recall, and f1-score for each class (currently assumes binary classes)
@@ -662,7 +674,8 @@ class Loops(Utils, AppliedModel):
         AppliedModel.__init__(self)
 
 
-    def _train_or_load_model(self, idx, rebuild, fit_model, outdir):
+    @classmethod
+    def _train_or_load_model(cls, idx, rebuild, fit_model, outdir):
         """
         Helper method for self.loop_over_configs. Train a CNN or load an existing model.
         Returns the BFGN Experiment and DataContainer objects that are needed for applying
@@ -725,10 +738,13 @@ class Loops(Utils, AppliedModel):
 
                 #find the type of input data used and update application filename to match
                 #BFGN needs application data with same number of bands as model training data
-                if len(self.data_types) > 0:
+                if self.data_types:
                     if self.data_types[idx] in self.parameter_combos[idx][1][0][0]:
+                        data_type = self.data_types[idx]
                         _f[0] = _f[0].replace('hires_surface', self.data_types[idx])
                         print('Changing filename', _f[0])
+                else:
+                    data_type = 'hires_surface'
 
                 apply_model_to_data.apply_model_to_site(experiment.model, data_container,\
                                                             _f, outdir+self.app_outnames[i])
@@ -743,12 +759,15 @@ class Loops(Utils, AppliedModel):
                                                                   threshold_val=threshold)
 
                 #apply NDVI threshold to thresholded classes
-                ndvi_file = _f[0].replace('hires_surface', 'ndvi_hires')
+                if any(s in data_type for s in ['hires_surface', 'hillshade', 'eigen']):
+                    ndvi_file = _f[0].replace(data_type, 'ndvi_hires')
+                else:
+                    ndvi_file = _f[0].replace(data_type, 'ndvi')
                 cut_classes = self.apply_ndvi_threshold(threshold_classes, ndvi_file,\
                                                         ndvi_threshold)
 
                 #make pdf showing applied model
-                hillshade = bool('res_surface' in _f[0])
+                hillshade = bool('res_surface' in _f[0] or 'hillshade' in _f[0])
                 self.show_applied_model(applied_model=applied_model, zoom=self.zooms[i],\
                                                 original_img=_f[0], hillshade=hillshade,\
                                                 responses=self.app_responses[i],\
@@ -764,7 +783,7 @@ class Loops(Utils, AppliedModel):
                 cut_stats.append(self.performance_metrics(cut_classes, self.app_responses[i],\
                                                 self.app_boundaries[i]))
 
-                if len(self.data_types) > 0:
+                if self.data_types:
                     _f[0] = _f[0].replace(self.data_types[idx], 'hires_surface')
 
         #store the performance stats (if any) for later use
@@ -991,7 +1010,7 @@ class Loops(Utils, AppliedModel):
                 colours = ['blueviolet', 'magenta', 'lightpink']
 
             precision = []
-            recall =[]
+            recall = []
             f_1 = []
             for i in range(to_plot.shape[0]):
                 precision.append(to_plot[i, j*3])
