@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-10-13
+#REM 2022-10-14
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -634,9 +634,9 @@ class AppliedModel():
         # in which everything outside the training dataset boundary/boundaries is NaN
         utils = Utils()
         mask = utils.boundary_shp_to_mask(boundary_file, responses)
+        response_array = utils.tif_to_array(responses)
 
         # insert the labelled responses into the array, inside the training boundaries
-        response_array = utils.tif_to_array(responses)
         mask[response_array != 0] = response_array[response_array != 0]
 
         # flatten to 1D and remove NaNs
@@ -764,7 +764,8 @@ class Loops(Utils, AppliedModel):
                 else:
                     ndvi_file = _f[0].replace(data_type, 'ndvi')
                 cut_classes = self.apply_ndvi_threshold(threshold_classes, ndvi_file,\
-                                                        ndvi_threshold)
+                                                        ndvi_threshold,\
+                                                        outfile=outdir+self.app_outnames[i])
 
                 #make pdf showing applied model
                 hillshade = bool('res_surface' in _f[0] or 'hillshade' in _f[0])
