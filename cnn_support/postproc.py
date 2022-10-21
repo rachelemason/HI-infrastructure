@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-10-20
+#REM 2022-10-21
 
 """
 Code for postprocessing of applied CNN models. Use in 'postproc' conda environment.
@@ -11,12 +11,14 @@ import glob
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+import scipy
+from skimage import measure
+from sklearn.metrics import classification_report
 import rasterio
 from rasterio.features import rasterize
 import fiona
 import gdal
-from skimage import measure
-from sklearn.metrics import classification_report
+
 
 pd.set_option('display.precision', 2)
 
@@ -50,8 +52,6 @@ class Ensemble():
         self.out_path = out_path
         self.apply_to = apply_to
         self.model_set = model_set
-        self.ensembled_probabilities = {} #will contain maps for probs, classes, cut_classes
-        self.ensemble_stats = {} #will contain stats for just one kind of map
 
 
     @classmethod
@@ -68,6 +68,105 @@ class Ensemble():
             arr = arr[0]
 
         return arr, meta
+
+
+    def average_applied_models(self, threshold=0.85, ndvi_threshold=0.5, show=False):
+        """
+        For each test region in self.apply_to, take a simple mean of a set of
+        *applied* models, i.e., the *probability* maps that are produced by BFGN.
+        Then, convert probabilities to classes using <threshold>, and apply an
+        ndvi cut using <ndvi_threshold>. Write each product to file at self.out_path
+        and create self.ensembled_probabilities, a dictionary in which
+        key=test region name, value = (mean probability map, class map, ndvi_cut_map).
+        """
+
+        ensembled_probabilities = {}
+        for region_name, region_data in self.apply_to.items():
+            model_list = []
+
+            #get the mean of the relevant models, for each test region
+            for model_dir in self.model_set:
+                this_file = glob.glob(f'{model_dir}applied_model_{region_name}.tif')[0]
+                this_array, meta = self.open_raster(this_file)
+                model_list.append(this_array)
+            mean = np.mean(model_list, axis=0)
+            mean = 1 - mean #need to do this in order to have building class=1
+
+            #apply a threshold to convert to binary classes
+            classes = np.zeros((mean.shape[0], mean.shape[1]))
+            classes[mean == -9999] = -9999
+            classes[np.logical_and(mean >= threshold, classes != -9999)] = 1
+
+            #apply the ndvi cut
+            ndvi_file = glob.glob(f'{DATA_PATH}{region_data}_ndvi_hires.tif')[0]
+            with rasterio.open(ndvi_file, 'r') as f:
+                ndvi = f.read()
+            cut_classes = np.expand_dims(classes, 0).astype(np.float32)
+            cut_classes[ndvi > ndvi_threshold] = 0
+
+            if show:
+                plt.imshow(cut_classes[0][20:-20, 20:-20])
+                plt.show()
+
+            #write the ndvi_cut map to file
+            os.makedirs(self.out_path, exist_ok=True)
+            meta.update(count=1)
+            with rasterio.open(f"{self.out_path}ndvi_cut_model_{region_name}.tif", 'w',\
+                               **meta) as f:
+                f.write(cut_classes)
+
+            ensembled_probabilities[region_name] = cut_classes[0]
+
+        return ensembled_probabilities
+
+
+    def average_cut_classes(self, show=True):
+        """
+        For each test region in self.apply_to, assign pixels to classes based on the majority
+        vote from each of a set of *ndvi_cut* models.
+        """
+
+        ensembled_classes = {}
+        for region_name in self.apply_to.keys():
+            print(f'Working on {region_name}')
+            model_list = []
+
+            #get the relevant ndvi cut models, for each test region
+            for model_dir in self.model_set:
+                this_file = glob.glob(f'{model_dir}ndvi_cut_model_{region_name}*tif')[0]
+                this_array, meta = self.open_raster(this_file)
+                model_list.append(this_array)
+
+            arr = np.stack(model_list, axis=0)
+            print('   - Calculating mode...')
+            arr2 = scipy.stats.mode(arr, axis=0).mode[0]
+
+            if show:
+                plt.imshow(arr2)
+                plt.show()
+
+            #write the ndvi_cut map to file
+            os.makedirs(self.out_path, exist_ok=True)
+            arr2 = np.expand_dims(arr2, 0).astype(np.float32)
+            meta.update(count=1)
+            with rasterio.open(f"{self.out_path}ndvi_cut_model_{region_name}.tif", 'w',\
+                               **meta) as f:
+                f.write(arr2)
+
+            ensembled_classes[region_name] = arr2[0]
+
+        return ensembled_classes
+
+
+class Performance(Ensemble):
+    """
+    Methods for assessing model performance/map quality
+    """
+
+    def __init__(self, apply_to, model_set, input_dir):
+        self.apply_to = apply_to
+        self.model_set = model_set
+        self.input_dir = input_dir
 
 
     #TODO: this is copied from cnn_support.Utils, should probably put that class into
@@ -91,73 +190,39 @@ class Ensemble():
         return mask
 
 
-    def average_applied_models(self, threshold=0.85, ndvi_threshold=0.5):
+    def get_individual_models(self):
         """
-        For each test region in self.apply_to, take a simple mean of a set of
-        *applied* models, i.e., the *probability* maps that are produced by BFGN.
-        Then, convert probabilities to classes using <threshold>, and apply an
-        ndvi cut using <ndvi_threshold>. Write each product to file at self.out_path
-        and create self.ensembled_probabilities, a dictionary in which
-        key=test region name, value = (mean probability map, class map, ndvi_cut_map).
+        Return arrays for the models (maps) that were used to create the ensembles,
+        so their performance can be compared
         """
 
-        for region_name, region_data in self.apply_to.items():
-            model_list = []
+        super_dict = {}
+        for idx, model_dir in enumerate(self.model_set):
+            model_dict = {}
+            for region_name in self.apply_to.keys():
+                this_file = glob.glob(f'{model_dir}ndvi_cut_model_{region_name}.tif')[0]
+                this_array, _ = self.open_raster(this_file)
+                model_dict[region_name] = this_array
+            super_dict[idx] = model_dict
 
-            #get the mean of the relevant models, for each test region
-            for applied_model in self.model_set:
-                this_file = glob.glob(f'{applied_model}*{region_name}*tif')[0]
-                this_array, meta = self.open_raster(this_file)
-                model_list.append(this_array)
-            mean = np.mean(model_list, axis=0)
-            mean = 1 - mean #need to do this in order to have building class=1
-
-            #apply a threshold to convert to binary classes
-            classes = np.zeros((mean.shape[0], mean.shape[1]))
-            classes[mean == -9999] = -9999
-            classes[np.logical_and(mean >= threshold, classes != -9999)] = 1
-
-            #apply the ndvi cut
-            ndvi_file = glob.glob(f'{DATA_PATH}{region_data}_ndvi_hires.tif')[0]
-            with rasterio.open(ndvi_file, 'r') as f:
-                ndvi = f.read()
-            cut_classes = np.expand_dims(classes, 0).astype(np.float32)
-            cut_classes[ndvi > ndvi_threshold] = 0
-
-            plt.imshow(cut_classes[0][20:-20, 20:-20], vmin=0, vmax=1, cmap='bwr')
-            plt.show()
-
-            #write all three ensemble products to file
-            os.makedirs(self.out_path, exist_ok=True)
-            meta.update(count=1)
-
-            for map_type in ['applied_model', 'threshold_model', 'ndvi_cut_model']:
-                with rasterio.open(f"{self.out_path}{map_type}.tif", 'w', **meta) as f:
-                    f.write(cut_classes) #THIS IS WRONG!!
-
-            self.ensembled_probabilities[region_name] = (mean, classes, cut_classes)
+        return super_dict
 
 
-    def performance_stats(self, map_type, trim=20):
+    def performance_stats(self, model, trim=20):
         """
-        Put performance stats for the building class in one type of map ('threshold'
-        or 'ndvi_cut') into self.ensemble_stats, and also display a dataframe showing
-        the stats.
+        Return a df containing performance stats for the building class in an ensembled
+        ndvi_cut map. The edges of the map are trimmed by <trim>
+        pixels in order to avoid messed-up edges being included in stats.
         """
 
         response_path = DATA_PATH.replace('features', 'buildings')
         boundary_path = DATA_PATH.replace('features', 'boundaries')
 
+        stats_dict = {}
         for region_name, region_data in self.apply_to.items():
+
             response_file = f'{response_path}{region_data}_responses.tif'
             boundary_file = f'{boundary_path}{region_data}_boundary.shp'
-
-            if map_type == 'threshold':
-                get_stats_for = self.ensembled_probabilities[region_name][1]
-            elif map_type == 'ndvi_cut':
-                get_stats_for = self.ensembled_probabilities[region_name][2]
-            else:
-                raise ValueError('map_type must be one of threshold|ndvi_cut')
 
             #This reproduces code from cnn_support but that's because I want to
             #avoid importing cnn_support so I can remove a number of the packages it
@@ -172,7 +237,9 @@ class Ensemble():
             #first, trim the edges off everything as they can contain weird stuff
             mask = mask[trim:-trim, trim:-trim]
             response_array = response_array[trim:-trim, trim:-trim]
-            get_stats_for = get_stats_for[:, trim:-trim, trim:-trim]
+            #avoid modifying existing dict
+            get_stats_for = model[region_name]
+            get_stats_for = get_stats_for[trim:-trim, trim:-trim]
             mask[response_array != 0] = response_array[response_array != 0]
 
             #flatten to 1D and remove NaNs
@@ -183,10 +250,31 @@ class Ensemble():
 
             #get performance metrics for the buildings class
             stats = classification_report(expected, predicted, output_dict=True)
-            self.ensemble_stats[region_name] = stats['1.0']
+            stats_dict[region_name] = stats['1.0']
 
-        df = pd.DataFrame.from_dict(self.ensemble_stats).T
+        df = pd.DataFrame.from_dict(stats_dict).T
         df.loc['mean'] = df.mean()
         df['support'] = df['support'].astype(int)
-        display(df)
-        
+
+        return df
+
+
+    def performance_plot(self, stats_list):
+        """
+        Make a multi-part figure showing precision, recall, f1-score for both
+        the ensemble maps in stats_list, and the individual maps in stats_list.
+        """
+
+        fig, _ = plt.subplots(4, 2, figsize=(12, 16))
+
+        x = range(len(self.apply_to))
+        for df, ax in zip(stats_list, fig.axes):
+            df = df.head(-1)
+            labels = [l for l in df.index]
+            ax.scatter(x, df['precision'], color='b', marker='o', s=100)
+            ax.scatter(x, df['recall'], color='lightblue', marker='^', s=100)
+            ax.scatter(x, df['f1-score'], color='k', marker='s', s=100)
+            ax.set_ylim(0, 0.99)
+            ax.set_xlabel(labels)
+
+        plt.subplots_adjust(hspace=0)
