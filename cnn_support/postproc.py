@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-10-25
+#REM 2022-10-26
 
 """
 Code for postprocessing of applied CNN models. Use in 'postproc' conda environment.
@@ -66,7 +66,8 @@ class Filter():
             ax.hist(pix, bins=100, density=True, color=color, lw=1.5, alpha=0.5, label=label)
 
         if cut is not None:
-            plt.axvline(cut)
+            plt.axvline(cut[0])
+            plt.axvline(cut[1])
         plt.legend(loc='upper left')
         plt.xlabel(data_type)
         plt.ylabel('Ill-defined frequency-related y-label...')
@@ -74,7 +75,7 @@ class Filter():
         #NOW SAVE THE FIGURE
 
 
-    def histo(self, data_type='ndvi', band=0, threshold=0.85, cut=0.5):
+    def histo(self, data_type='ndvi', band=0, threshold=0.85, cut_range=None):
         """
         Make a plot showing NDVI for (and sample of) all pixels, and pixels classified
         as buildings.
@@ -107,11 +108,12 @@ class Filter():
         all_pix = [a for a in all_pix if a > -9999]
         building_pix = [b for b in building_pix if b > -9999]
 
-        if cut is not None:
+        if cut_range is not None:
             print(f'There are {len(building_pix)} candidate building pixels')
-            print(f'Applying the cut preserves {len([b for b in building_pix if b < cut])} pixels')
+            num = len([b for b in building_pix if (b > cut_range[0] and b < cut_range[1])])
+            print(f'Applying the cut preserves {num} pixels')
 
-        self._create_hist([all_pix, building_pix], data_type, cut)
+        self._create_hist([all_pix, building_pix], data_type, cut_range)
 
 
 class Ensemble():
@@ -143,21 +145,23 @@ class Ensemble():
             print(f'Working on {region_name}')
             model_list = []
 
-            #get the mean of the relevant maps, for each test region
+            #get the relevant maps, for each test region
             for model_dir in self.model_set:
                 this_file = glob.glob(f'{model_dir}{start_from}_{region_name}.tif')[0]
                 this_array, meta = open_raster(this_file)
                 model_list.append(this_array)
-            mean = np.mean(model_list, axis=0)
+
 
             if start_from == 'applied_model':
-                #need to do this in order to have building class=1 when starting from prob. maps
-                mean = 1 - mean
+                #take the MEAN of the probabilities
+                combo = np.mean(model_list, axis=0)
+                #do this in order to have building class=1 when starting from prob. maps
+                combo = 1 - combo
 
                 #apply a threshold to convert to binary classes
-                classes = np.zeros((mean.shape[0], mean.shape[1]))
-                classes[mean == -9999] = -9999
-                classes[np.logical_and(mean >= threshold, classes != -9999)] = 1
+                classes = np.zeros((combo.shape[0], combo.shape[1]))
+                classes[combo == -9999] = -9999
+                classes[np.logical_and(combo >= threshold, classes != -9999)] = 1
 
                 #apply the ndvi cut
                 ndvi_file = glob.glob(f'{DATA_PATH}{region_data}_ndvi_hires.tif')[0]
@@ -166,7 +170,10 @@ class Ensemble():
                 cut_classes = np.expand_dims(classes, 0).astype(np.float32)
                 cut_classes[ndvi > ndvi_threshold] = 0
             else:
-                cut_classes = np.expand_dims(mean, 0).astype(np.float32)
+                #find the SUM of the maps, which can be interpreted as the number of 'votes'
+                #for a candidate building pixel
+                combo = np.sum(model_list, axis=0)
+                cut_classes = np.expand_dims(combo, 0).astype(np.float32)
 
             if show:
                 plt.imshow(cut_classes[0][20:-20, 20:-20])
@@ -188,15 +195,15 @@ class Ensemble():
         """
         For an ensemble created by self.create_ensemble() with <start_from>='ndvi_cut_model',
         return a version converted to binary classes using <n_votes>. The input ensemble will have
-        pixel values = 0-1 in steps of 1/n, where n is the number of models that went into the
+        pixel values = 0-n in steps of 1, where n is the number of models that went into the
         ensemble. For example, an ensemble map created from 5 individual models has pixel values
         like this:
         0 - no models assigned class 'building' to this pixel
-        0.2 - 1 model assigned class 'building' to this pixel
-        0.4 - 2 models assigned class 'building' to this pixel
-        0.6 - 3 models assigned class 'building' to this pixel
-        0.8 - 4 models assigned class 'building' to this pixel
-        1.0 - 5 models assigned class 'building' to this pixel
+        1 - 1 model assigned class 'building' to this pixel
+        2 - 2 models assigned class 'building' to this pixel
+        3 - 3 models assigned class 'building' to this pixel
+        4 - 4 models assigned class 'building' to this pixel
+        5 - 5 models assigned class 'building' to this pixel
         Setting <n_votes>=4 will produce a model with binary building/not-building classes such
         that each building will have received a positive classification from 4 input models.
         This method must be used in order to produce a model that is understood by Performance.
@@ -206,9 +213,8 @@ class Ensemble():
         binary_maps = {}
         for region in self.apply_to.keys():
             arr = ensemble[region].copy()
-            threshold = np.unique(arr)[n_votes]
-            arr[arr >= threshold] = 1
-            arr[arr < threshold] = 0
+            arr[arr < n_votes] = 0
+            arr[arr >= n_votes] = 1
             binary_maps[region] = arr
 
         return binary_maps
@@ -219,10 +225,9 @@ class Performance():
     Methods for assessing model performance/map quality
     """
 
-    def __init__(self, apply_to, model_set, input_dir):
+    def __init__(self, apply_to, model_set):
         self.apply_to = apply_to
         self.model_set = model_set
-        self.input_dir = input_dir
 
 
     #TODO: this is copied from cnn_support.Utils, should probably put that class into
