@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-10-14
+#REM 2022-12-06
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -75,20 +75,27 @@ class Utils():
         pass
 
     @classmethod
-    def count_buildings(cls, path, available_training_sets):
+    def count_buildings(cls, feature_path, response_path, available_training_sets):
         """
         Count and print the number of polygons (which are generally buildings)
         in each shapefile in available_training_data. Also print the number of
         polygons/buildings in the entire training set.
         """
 
-        count = 0
+        building_count = 0
+        pixel_count = 0
         for nickname, shpfile in available_training_sets.items():
-            if 'HBLower' not in shpfile: #avoid double-counting overlap with HBMain
-                geom = fiona.open(path+shpfile+'_responses.shp')
-                print(f"{nickname} contains {len(geom)} features")
-                count += len(geom)
-        print(f'Total number of features = {count}')
+            if 'HBMain' not in shpfile: #avoid double-counting overlap with HBLower
+                geom = fiona.open(response_path+shpfile+'_responses.shp')
+                
+                with rasterio.open(feature_path+shpfile+'_hires_surface.tif') as src:
+                    pixels = src.shape[0] * src.shape[1]
+                    
+                print(f"{nickname} contains {pixels} pixels and {len(geom)} features")
+                building_count += len(geom)
+                pixel_count += pixels
+        print(f'Total number of features = {building_count}')
+        print(f'Total number of pixels = {pixel_count}')
 
 
     @classmethod
@@ -453,7 +460,7 @@ class AppliedModel():
 
 
     def apply_model(self, config_file, application_file, outfile, method='threshold',\
-                    ndvi_threshold=None, ndvi_file=None):
+                    ndvi_cut=None, ndvi_file=None):
         """
         Apply an existing model to a new area, convert probabilities to binary classes,
         and write to some sensible storage location. This method is intended to be used to
@@ -483,26 +490,26 @@ class AppliedModel():
         classes = self.probabilities_to_classes(method, applied_model,\
                                                 tif_template=outfile+'.tif')
 
-        if ndvi_threshold and ndvi_file:
-            self.apply_ndvi_threshold(classes, ndvi_file, ndvi_threshold, outfile)
+        if ndvi_cut and ndvi_file:
+            self.apply_ndvi_cut(classes, ndvi_file, ndvi_cut, outfile)
 
 
     @classmethod
-    def apply_ndvi_threshold(cls, classes, ndvi_file, ndvi_threshold, outfile=None):
+    def apply_ndvi_cut(cls, classes, ndvi_file, ndvi_cut, outfile=None):
         """
         Apply an NDVI cut to a model array that contains binary classes. Finds the NDVI
-        value in <ndvi_file> for each model pixel, and if it exceeds <ndvi_threshold>,
-        the class is changed from 1 to 0. This was written to exclude trees that were
-        incorrectly identified as buildings.
+        value in <ndvi_file> for each model pixel, and if it is greater than ndvi_cut,
+        the class is changed from 1 to 0. This was written to exclude trees
+        and the few water pixels that were incorrectly identified as buildings.
         """
 
-        print(' -- applying NDVI threshold')
+        print(' -- applying NDVI cut')
         print(ndvi_file)
         with rasterio.open(ndvi_file, 'r') as f:
             meta = f.meta.copy()
             ndvi = f.read()
         cut_classes = np.expand_dims(classes, 0).astype(np.float32)
-        cut_classes[ndvi > ndvi_threshold] = 0
+        cut_classes[ndvi > ndvi_cut] = 0
         if outfile is not None:
             with rasterio.open(f"{outfile.replace('applied', 'ndvi_cut')}.tif", 'w', **meta) as f:
                 f.write(cut_classes)
@@ -719,7 +726,7 @@ class Loops(Utils, AppliedModel):
         return experiment, data_container
 
 
-    def _apply_model(self, idx, outdir, threshold=0.90, ndvi_threshold=0.5):
+    def _apply_model(self, idx, outdir, threshold=0.90, ndvi_cut=None):
         """
         Helper method for self.loop_over_configs. Apply an existing trained model
         to data (test fields), write image files, and return performance metrics.
@@ -763,8 +770,7 @@ class Loops(Utils, AppliedModel):
                     ndvi_file = _f[0].replace(data_type, 'ndvi_hires')
                 else:
                     ndvi_file = _f[0].replace(data_type, 'ndvi')
-                cut_classes = self.apply_ndvi_threshold(threshold_classes, ndvi_file,\
-                                                        ndvi_threshold,\
+                cut_classes = self.apply_ndvi_cut(threshold_classes, ndvi_file, ndvi_cut,\
                                                         outfile=outdir+self.app_outnames[i])
 
                 #make pdf showing applied model
@@ -818,7 +824,7 @@ class Loops(Utils, AppliedModel):
 
 
     def loop_over_configs(self, rebuild_data=False, fit_model=True, apply_model=True,\
-                          use_existing=True, threshold=0.95):
+                          use_existing=True, threshold=0.95, ndvi_cut=None):
         """
         Loops over BFGN configurations (can be training data or other parameters in the
         config file), and returns a numpy array of model performance metrics (precision,
@@ -876,10 +882,10 @@ class Loops(Utils, AppliedModel):
                         print(f'Loaded stats for {outdir} from file')
                     except FileNotFoundError:
                         print(f'Saved stats not found in {outdir}; applying model')
-                        stats0, stats1, stats2 = self._apply_model(idx, outdir, threshold)
+                        stats0, stats1, stats2 = self._apply_model(idx, outdir, threshold, ndvi_cut)
                         plt.close('all')
                 else:
-                    stats0, stats1, stats2 = self._apply_model(idx, outdir, threshold)
+                    stats0, stats1, stats2 = self._apply_model(idx, outdir, threshold, ndvi_cut)
                     plt.close('all')
                 ml_stats.append(stats0)
                 threshold_stats.append(stats1)

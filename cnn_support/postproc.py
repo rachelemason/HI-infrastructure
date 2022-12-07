@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-#cnn_support.py
-#REM 2022-10-26
+#postproc.py
+#REM 2022-12-06
 
 """
 Code for postprocessing of applied CNN models. Use in 'postproc' conda environment.
@@ -9,16 +9,21 @@ Code for postprocessing of applied CNN models. Use in 'postproc' conda environme
 import os
 import random
 import glob
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
+import geopandas as gpd
 from skimage import measure
 from sklearn.metrics import classification_report
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.features import rasterize
+from rasterio.merge import merge
+from rasterio.mask import mask
 import fiona
 import gdal
+from shapely.geometry import shape, asShape
 
 pd.set_option('display.precision', 2)
 
@@ -191,7 +196,7 @@ class Ensemble():
         return ensemble
 
 
-    def choose_cut_level(self, ensemble, n_votes):
+    def choose_cut_level(self, ensemble, name, n_votes):
         """
         For an ensemble created by self.create_ensemble() with <start_from>='ndvi_cut_model',
         return a version converted to binary classes using <n_votes>. The input ensemble will have
@@ -209,15 +214,134 @@ class Ensemble():
         This method must be used in order to produce a model that is understood by Performance.
         performance_stats.
         """
+        
+        input_map = f"{self.out_path}ndvi_cut_model_{name}.tif"
+        print(f'Creating {self.out_path}ensemble_{n_votes}votes_{name}.tif')
+        
+        if ensemble == 'from_file':
+            arr, meta = open_raster(input_map)
+        else:
+            arr = ensemble.copy()
+            with rasterio.open(input_map, 'r') as f:
+                meta = f.meta
+                
+        arr[arr < n_votes] = 0
+        arr[arr >= n_votes] = 1
 
-        binary_maps = {}
-        for region in self.apply_to.keys():
-            arr = ensemble[region].copy()
-            arr[arr < n_votes] = 0
-            arr[arr >= n_votes] = 1
-            binary_maps[region] = arr
+        #write the map to file
+        binary_map = np.expand_dims(arr, 0).astype(np.float32)
+        with rasterio.open(f"{self.out_path}ensemble_{n_votes}votes_{name}.tif", 'w',\
+                            **meta) as f:
+            f.write(binary_map)
 
-        return binary_maps
+        return arr
+
+
+    def mosaic_crop_trim(self, tiles, n_votes, outfile, shapefile, edge_buf=30):
+        """
+        """
+        
+        nanpath = '/data/gdcsdata/HawaiiMapping/Full_Backfilled_Tiles/'
+
+        for tile in tiles:
+            
+            #Get the original LiDAR for this tile, which tells us where no-data regions are
+            #Crop to the shapefile boundaries
+            with rasterio.open(f'{nanpath}{tile}/{tile}_backfilled_surface_1mres.tif') as f:
+                nans = f.read()
+                nan_meta = f.meta
+                
+            #get the map for this tile and crop to the shapefile boundaries
+            with rasterio.open(f'{self.out_path}ensemble_{n_votes}votes_{tile}.tif') as f:
+                arr = f.read()
+    
+            #set the relevant parts of the map to -9999 (where there were no LiDAR data)
+            arr[nans == nan_meta['nodata']] = -9999
+
+            with rasterio.open(f'{self.out_path}temp_{tile}.tif', 'w', **nan_meta) as temp:
+                temp.write(arr)
+            
+            plt.imshow(arr[0], vmin=-9999, vmax=1)
+            plt.show()
+            
+            #Now, work on extending the NaN regions to 'rub out' the edge effects
+
+            #get the indexes of the NaN (-9999) values in the map
+            print('Getting all NaN indices')
+            idx1 = np.where(arr[0] < 0)
+            idx = list(zip(idx1[0], idx1[1]))
+
+            #find the indices of the NaNs that don't just have NaNs as neighbours -
+            #these mark the edges we want to edit around
+            print('Getting edge indices')
+            idx2 = []
+            for i in idx:
+                neighbors = arr[:, i[0]-1:i[0]+1+1, i[1]-1:i[1]+1+1]
+                if len(np.unique(neighbors)) > 1:
+                    idx2.append(i)
+
+            #set the pixels within <edge_buffer> of these indices to -9999
+            print('Editing edge indices')
+            for i in idx2:
+                arr[:, i[0]-edge_buf:i[0]+edge_buf+1, i[1]-edge_buf:i[1]+edge_buf+1] = -9999
+                
+            #plot and save the edited map tile
+            plt.imshow(arr[0], vmin=-9999, vmax=1)
+            
+            print('Writing file')
+            with rasterio.open(f'{self.out_path}edges_cleaned_{tile}.tif', 'w', **nan_meta) as temp:
+                temp.write(arr)
+
+
+    def add_nan_values(self, name, n_votes):
+        """
+        Replaces regions of 'edge effects' (bands of spurious building detections around
+        the edges of the the LiDAR data) with NaNs. Also sets regions of no LiDAR coverage
+        from 0 (not-building) to NaN (that should have been done as the maps were created/
+        preserved as they were modified, but somehow it wasn't). The regions to be set to
+        NaN are taken from files in which the edge effects were manually edited out; this
+        method is just a way of automatically recreating that.
+        """
+        
+        in_file = f"{self.out_path}ensemble_{n_votes}votes_{name}.tif"
+        print(f'Removing edge effects and no-data regions from {in_file}')
+        with rasterio.open(f"{in_file}, 'r'") as f:
+            arr = f.read()
+            meta = f.meta
+            
+        nanpath = '/data/gdcsdata/HawaiiMapping/Full_Backfilled_Tiles/'
+        with rasterio.open(f'{nanpath}{name}/{name}_backfilled_surface_1mres.tif') as f:
+            nans = f.read()
+            nan_meta = f.meta
+            
+        arr[nans == nan_meta['nodata']] = -9999
+        plt.imshow(arr[0], vmin=-9999, vmax=1)
+        
+        with rasterio.open(f"{self.out_path}ensemble_{n_votes}votes_edgesout_{name}.tif",\
+                           'w', **meta) as f:
+            f.write(arr)
+        
+
+    def id_instances(self, to_segment, reference_file):
+        """
+        Convert connected groups of pixels into labelled instances
+        """
+
+        with rasterio.open(reference_file, 'r') as f:
+            meta = f.meta
+        instances = measure.label(to_segment, connectivity=2)
+        instances[instances == 0] = -9999
+        instances[instances > 0] = 1
+        for i in instances:
+            polysize = [x for x in i if x > -9999]
+            if len(polysize) < 10:
+                print(polysize)
+        plt.imshow(instances)
+        polygons = []
+        for vec in rasterio.features.shapes(instances.astype(np.int32), transform=meta['transform']):
+            polygons.append(shape(vec[0]))
+        gdf = gpd.GeoDataFrame(crs=meta['crs'], geometry=polygons)
+        gdf.to_file(reference_file.replace('tif', 'shp'), driver='ESRI Shapefile')
 
 
 class Performance():
@@ -251,7 +375,7 @@ class Performance():
         return mask
 
 
-    def get_individual_models(self):
+    def get_individual_models(self, model_type='ndvi_cut'):
         """
         Return arrays for the models (maps) that were used to create the ensembles,
         so their performance can be compared
@@ -261,7 +385,7 @@ class Performance():
         for idx, model_dir in enumerate(self.model_set):
             model_dict = {}
             for region_name in self.apply_to.keys():
-                this_file = glob.glob(f'{model_dir}ndvi_cut_model_{region_name}.tif')[0]
+                this_file = glob.glob(f'{model_dir}{model_type}_model_{region_name}.tif')[0]
                 this_array, _ = open_raster(this_file)
                 model_dict[region_name] = this_array
             super_dict[idx] = model_dict
@@ -319,7 +443,7 @@ class Performance():
 
         return df
 
-
+    
     def performance_plot(self, stats_list):
         """
         Make a multi-part figure showing precision, recall, f1-score for both
@@ -341,19 +465,23 @@ class Performance():
         plt.subplots_adjust(hspace=0)
 
 
-class InstanceSeg():
-    """
-    Tools for converting from semantic segmentation to instance segmentation
-    """
-
-    def __init__(self):
-        pass
-
-
-    def id_instances(self, class_map):
+    @classmethod
+    def load_stats(cls, model_set, model_kind='threshold'):
         """
-        Convert connected groups of pixels into labelled instances
+        Print precision, recall, and f1-score averaged over all test areas in
+        all <model_kind> models used in the ensembles. This gives the stats in
+        rows 1 and 2 in Table 1 of the infrastructure paper.
         """
-
-        instances = measure.label(class_map, connectivity=2)
-        return instances
+        
+        print(f'Stats averaged over all test areas, all {model_kind} models in the ensembles:')
+        
+        mean_stats = {'precision': [], 'recall': [], 'f1-score': []}
+        for model in model_set:
+            with open (glob.glob(f'{model}*{model_kind}.json')[0]) as f:
+                stats = json.load(f)
+            for test_area in stats:
+                for metric in ['precision', 'recall', 'f1-score']:
+                    mean_stats[metric].append(test_area['1.0'][metric])
+        for metric, values in mean_stats.items():
+            print(metric, f'{np.mean(values):.2f}')
+            
