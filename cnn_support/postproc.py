@@ -322,9 +322,10 @@ class Ensemble():
             f.write(arr)
         
 
-    def id_instances(self, to_segment, reference_file):
+    def id_instances(self, to_segment, reference_file, minpix=20):
         """
-        Convert connected groups of pixels into labelled instances
+        Convert connected groups of pixels into labelled instances,
+        excluding ones that contain fewer than <minpix> pixels.
         """
 
         with rasterio.open(reference_file, 'r') as f:
@@ -332,15 +333,13 @@ class Ensemble():
         instances = measure.label(to_segment, connectivity=2)
         instances[instances == 0] = -9999
         instances[instances > 0] = 1
-        for i in instances:
-            polysize = [x for x in i if x > -9999]
-            if len(polysize) < 10:
-                print(polysize)
-        plt.imshow(instances)
+
         polygons = []
         for vec in rasterio.features.shapes(instances.astype(np.int32), transform=meta['transform']):
             polygons.append(shape(vec[0]))
         gdf = gpd.GeoDataFrame(crs=meta['crs'], geometry=polygons)
+        gdf = gdf.head(-1) #last polygon covers entire array, so delete it
+        gdf = gdf.loc[gdf.geometry.area >= minpix] #remove very small polygons
         gdf.to_file(reference_file.replace('tif', 'shp'), driver='ESRI Shapefile')
 
 
