@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #postproc.py
-#REM 2022-12-12
+#REM 2022-12-15
 
 """
 Code for postprocessing of applied CNN models. Use in 'postproc' conda environment.
@@ -13,17 +13,16 @@ import json
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-import geopandas as gpd
-from skimage import measure
 from sklearn.metrics import classification_report
+from shapely.geometry import shape, MultiPolygon, Polygon
+#from shapely.validation import make_valid
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.features import rasterize
 from rasterio.merge import merge
-from rasterio.mask import mask
 import fiona
 import gdal
-from shapely.geometry import shape, asShape
+import geopandas as gpd
 
 pd.set_option('display.precision', 2)
 
@@ -56,7 +55,8 @@ class Filter():
         self.applied_models = applied_models
 
 
-    def _create_hist(self, data, data_type, cut):
+    @classmethod
+    def _create_hist(cls, data, data_type, cut):
         """
         Helper method for self.histo; actually creates the histogram.
         """
@@ -214,17 +214,17 @@ class Ensemble():
         This method must be used in order to produce a model that is understood by Performance.
         performance_stats.
         """
-        
+
         input_map = f"{self.ensemble_path}ndvi_cut_model_{name}.tif"
         print(f'Creating {self.out_path}ensemble_{n_votes}votes_{name}.tif')
-        
+
         if ensemble == 'from_file':
             arr, meta = open_raster(input_map)
         else:
             arr = ensemble.copy()
             with rasterio.open(input_map, 'r') as f:
                 meta = f.meta
-                
+
         arr[arr < n_votes] = 0
         arr[arr >= n_votes] = 1
 
@@ -236,45 +236,41 @@ class Ensemble():
 
         return arr
 
-    
+
     def trim_ensemble_tiles(self, tile_list, n_votes):
         """
         Trim ensemble tiles and LiDAR data to more manageable sizes, by removing
         areas that are all NaN.
         """
-        
+
         nanpath = '/data/gdcsdata/HawaiiMapping/Full_Backfilled_Tiles/'
-        
+
         for tile in tile_list:
             #Get the original LiDAR for this tile, which tells us where no-data regions are
             print(f'Filling in NaN values for {tile} from DSM')
             with rasterio.open(f'{nanpath}{tile}/{tile}_backfilled_surface_1mres.tif') as f:
                 nans = f.read()
                 nan_meta = f.meta
-                
+
             #get the map for this tile
             with rasterio.open(f'{self.out_path}ensemble_{n_votes}votes_{tile}.tif') as f:
                 arr = f.read()
                 profile = f.profile
-            
+
             arr[nans == nan_meta['nodata']] = -9999
 
-            plt.imshow(arr[0], vmin=-9999, vmax=1)
-            plt.show()
-
-            #tiles 7, 12, 14, 15, 19, 20, 21, 22, 31 can't/don't need to be cropped
+            #tiles 7, 12, 14, 15, 18, 19, 20, 21, 22, 31 can't/don't need to be cropped
             tile_crop_dict = {'tile008': [3000, -1, 0, -1], 'tile009': [14000, -1, 0, 18000],\
-                              'tile016': [2500, -1, 0, 10000], 'tile018': [],\
-                              'tile024': [0, -1, 12500, -1], 'tile025': [0, -1, 0, 20000],\
-                              'tile030': [0, -1, 15000, -1]}
+                              'tile016': [2500, -1, 0, 10000], 'tile024': [0, -1, 12500, -1],\
+                              'tile025': [0, -1, 0, 20000], 'tile030': [0, -1, 15000, -1]}
             try:
                 idx = tile_crop_dict[tile]
                 nans = nans[:, idx[0]:idx[1], idx[2]:idx[3]]
                 arr = arr[:, idx[0]:idx[1], idx[2]:idx[3]]
                 plt.imshow(arr[0])
                 plt.show()
-                win=((idx[0], idx[1]),(idx[2], idx[3]))
-                profile=profile.copy()
+                win = ((idx[0], idx[1]), (idx[2], idx[3]))
+                profile = profile.copy()
                 profile['width'] = arr.shape[2]
                 profile['height'] = arr.shape[1]
                 profile['transform'] = f.window_transform(win)
@@ -287,7 +283,7 @@ class Ensemble():
                                'w', **profile) as f:
                 f.write(arr)
 
-    
+
     def nans_and_edges(self, tiles, n_votes, edge_buf=30):
         """
         Add NaNs to the ensemble for this tile (specified by <tile> and <n_votes> where
@@ -296,30 +292,16 @@ class Ensemble():
         This needs a LOT of memory to run on full tiles, especially those with a lot of NaN
         pixels. 80Gb seems to work in all cases except tile009, which has to be cropped.
         """
-        
-        #nanpath = '/data/gdcsdata/HawaiiMapping/Full_Backfilled_Tiles/'
 
         for tile in tiles:
-            
+
             print(f'Working on {tile}')
-                        
-            #Get the original LiDAR for this tile, which tells us where no-data regions are
-            #print('Filling in NaN values from DSM')
-            #with rasterio.open(f'{nanpath}{tile}/{tile}_backfilled_surface_1mres.tif') as f:
-            #    nans = f.read()
-            #    nan_meta = f.meta
-                
+
             #get the (trimmed) map for this tile
             with rasterio.open(f'{self.out_path}trimmed_{n_votes}votes_{tile}.tif') as f:
                 arr = f.read()
                 meta = f.meta
-                
-            #set the relevant parts of the map to -9999 (where there were no LiDAR data)
-            #arr[nans == nan_meta['nodata']] = -9999
 
-            #plt.imshow(arr[0], vmin=-9999, vmax=1)
-            #plt.show()
-            
             #Now, work on extending the NaN regions to 'rub out' the edge effects
 
             #get the indexes of the NaN (-9999) values in the map
@@ -340,15 +322,15 @@ class Ensemble():
             print('...editing edge indices')
             for i in idx2:
                 arr[:, i[0]-edge_buf:i[0]+edge_buf+1, i[1]-edge_buf:i[1]+edge_buf+1] = -9999
-                
+
             #plot and save the edited map tile
             plt.imshow(arr[0], vmin=-9999, vmax=1)
-            
+
             print('...writing file')
             with rasterio.open(f'{self.out_path}edges_cleaned_{tile}.tif', 'w', **meta) as temp:
                 temp.write(arr)
 
-    
+
     def mosaic_and_crop(self, tiles, shapefile, outname):
         """
         Mosaic a set of 'edges_cleaned' tiles and crop to the boundaries of
@@ -375,49 +357,101 @@ class Ensemble():
         with rasterio.open(f"{self.out_path}temp.tif") as f:
             cropped, out_trans = rasterio.mask.mask(f, shapes, crop=True)
             meta = f.meta
-            
+
         meta.update({"height": cropped.shape[1], "width": cropped.shape[2], "transform": out_trans})
         with rasterio.open(f'{self.out_path}{outname}.tif', "w", **meta) as f:
             f.write(cropped)
 
         os.remove(f"{self.out_path}temp.tif")
-        
 
-    def vectorise(self, mosaic_name, minpix=25):
+
+class VectorManips():
+    """
+    Methods for vectorizing ensemble maps and improving building outlines
+    """
+
+    def __init__(self, data_path):
+        self.data_path = data_path
+
+
+    def road_intersects(self):
+        """
+        Remove polygons that intersect with state and county roads
+        """
+
+    @classmethod
+    def _close_holes(cls, geom):
+        """
+        Helper method for self.vectorise(). Removes interior holes from polygons.
+        See stackoverflow.com/questions/63317410/how-to-fill-holes-in-multi-polygons
+        -created-when-dissolving-geodataframe-with-ge
+        """
+
+        def remove_interiors(poly):
+            if poly.interiors:
+                return Polygon(list(poly.exterior.coords))
+            else:
+                return poly
+
+        if isinstance(geom, MultiPolygon):
+            geos = gpd.GeoSeries([remove_interiors(g) for g in geom])
+            geoms = [g.area for g in geos]
+            big = geoms.pop(geoms.index(max(geoms)))
+            outers = geos.loc[~geos.within(big)].tolist()
+            if outers:
+                return MultiPolygon([big] + outers)
+            return Polygon(big)
+        if isinstance(geom, Polygon):
+            return remove_interiors(geom)
+
+
+    def vectorise(self, raster, minpix=25):
         """
         Vectorise a mosaic created by self.mosaic_and_crop(). Remove
         polygons containing fewer than <minpix> pixels, as they're probably
         false positives. Write a shapefile with the name as the input tif,
         <mosaic_name>.
         """
-        
-        with rasterio.open(f'{self.out_path}{mosaic_name}.tif', 'r') as f:
+
+        with rasterio.open(f'{self.data_path}{raster}.tif', 'r') as f:
             arr = f.read()
             meta = f.meta
-            
-        print(f'Vectorizing {mosaic_name}')
+
+        print(f'Vectorizing {raster}')
         polygons = []
         values = []
         for vec in rasterio.features.shapes(arr.astype(np.int32), transform=meta['transform']):
             polygons.append(shape(vec[0]))
             values.append(vec[1])
         gdf = gpd.GeoDataFrame(crs=meta['crs'], geometry=polygons)
-        
+
         gdf['Values'] = values
-        
+
+        #remove polygons composed of NaNs or 0s (building == 1)
+        gdf = gdf[gdf['Values'] > 0]
+
         #remove very small polygons
         gdf = gdf.loc[gdf.geometry.area >= minpix]
-        
-        #remove polygons composed of NaNs
-        gdf = gdf[gdf['Values'] > 0]
-        
-        #last polygon covers entire array, so delete it
-        #TODO: is this now necessary?
-        #gdf = gdf.head(-1)
 
-        mosaic_name = mosaic_name.replace('tif', 'shp')
-        print(f"Writing {self.out_path}{mosaic_name}")
-        gdf.to_file(f'{self.out_path}{mosaic_name}', driver='ESRI Shapefile')
+        #Remove any interior holes
+        gdf.geometry = gdf.geometry.apply(lambda row: self._close_holes(row))
+
+        #Apply negative then positive buffer, to remove spiky bits and disconnect
+        #polygons that are connected by a thread (they are usually separate buildings)
+        gdf.geometry = gdf.geometry.buffer(-3)
+        #Delete polygons that get 'emptied' by negative buffering
+        gdf = gdf[~gdf.geometry.is_empty]
+        #Apply positive buffer to regain approx. original shape
+        gdf.geometry = gdf.geometry.buffer(3)
+        #If polygons have been split into multipolygons, explode into separate rows
+        gdf = gdf.explode().reset_index(drop=True)
+
+        boxes = gdf.apply(lambda row: row['geometry'].minimum_rotated_rectangle, axis=1)
+        gdf.geometry = boxes
+
+        file_name = raster+'.shp'
+        print(f"Writing {self.data_path}{file_name}")
+        gdf.to_file(f'{self.data_path}{file_name}', driver='ESRI Shapefile')
 
 
 class Performance():
@@ -519,7 +553,7 @@ class Performance():
 
         return df
 
-    
+
     def performance_plot(self, stats_list):
         """
         Make a multi-part figure showing precision, recall, f1-score for both
@@ -548,12 +582,12 @@ class Performance():
         all <model_kind> models used in the ensembles. This gives the stats in
         rows 1 and 2 in Table 1 of the infrastructure paper.
         """
-        
+
         print(f'Stats averaged over all test areas, all {model_kind} models in the ensembles:')
-        
+
         mean_stats = {'precision': [], 'recall': [], 'f1-score': []}
         for model in model_set:
-            with open (glob.glob(f'{model}*{model_kind}.json')[0]) as f:
+            with open(glob.glob(f'{model}*{model_kind}.json', encoding='utf-8')[0]) as f:
                 stats = json.load(f)
             for test_area in stats:
                 for metric in ['precision', 'recall', 'f1-score']:
