@@ -26,6 +26,7 @@ import geopandas as gpd
 pd.set_option('display.precision', 2)
 
 DATA_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_features/'
+GEO_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/geo_data/'
 
 #generic function for opening rasters
 #TODO: should really go in some utility file
@@ -372,7 +373,6 @@ class VectorManips():
     def __init__(self, data_path):
         self.data_path = data_path
 
-
     @classmethod
     def _close_holes(cls, geom):
         """
@@ -411,6 +411,22 @@ class VectorManips():
             roads = roads[roads['island'].str.match('Hawaii')]
             roads.geometry = roads.geometry.buffer(1)
             gdf = gdf.loc[~gdf.intersects(roads.unary_union)].reset_index(drop=True)
+
+        return gdf
+
+
+    def _remove_coastal_artefacts(self, gdf):
+        """
+        Helper method for self.vectorise(). Reads in coastline shapefile and
+        removes polygons from <gdf> that intersect with the coast. Returns
+        edited <gdf>. Intended for removing coastal artefacts.
+        """
+
+        coast = gpd.read_file(f'{GEO_PATH}Coastline/Coastline.shp')
+        coast = coast[coast['isle'] == 'Hawaii'].reset_index(drop=True)
+        coast = coast.to_crs(epsg=32605)
+
+        gdf = gdf.loc[gdf.within(coast.unary_union)].reset_index(drop=True)
 
         return gdf
 
@@ -455,7 +471,7 @@ class VectorManips():
         #Apply positive buffer to regain approx. original shape
         gdf.geometry = gdf.geometry.buffer(3)
         #If polygons have been split into multipolygons, explode into separate rows
-        gdf = gdf.explode().reset_index(drop=True)
+        gdf = gdf.explode(index_parts=True).reset_index(drop=True)
 
         #Get the oriented envelope/bounding rectangle
         boxes = gdf.apply(lambda row: row['geometry'].minimum_rotated_rectangle, axis=1)
@@ -464,6 +480,9 @@ class VectorManips():
         #Remove polygons that intersect roads
         if road_files:
             gdf = self._remove_roads(gdf, road_files)
+
+        #Remove polygons that intersect the coastline
+        gdf = self._remove_coastal_artefacts(gdf)
 
         print(f'There are {len(gdf)} building candidates in the {raster} map')
 
@@ -657,16 +676,15 @@ class Performance():
         #Once polygon matches have been made, should be straightforward to rasterize
         #and calculate other stats as well
 
+
 class Analysis():
     """
     Calculate various numbers needed for the mapping paper
     """
 
-    def __init__(self, map_path, geo_path, analysis_path):
+    def __init__(self, map_path, analysis_path):
         self.map_path = map_path
-        self.geo_path = geo_path
         self.analysis_path = analysis_path
-        self.parcel_data = None #defined in parcel_ocean_distance()
 
 
     def total_area(self):
@@ -728,7 +746,7 @@ class Analysis():
             mapped_region = mapped_region[mapped_region['Values'] >= 0]
             mapped_region = mapped_region.dissolve(by='Values').reset_index()
 
-            mapped_region.to_file(f'{self.geo_path}{region}_mapped_region', driver='ESRI Shapefile')
+            mapped_region.to_file(f'{GEO_PATH}{region}_mapped_region', driver='ESRI Shapefile')
 
             return mapped_region
 
@@ -740,25 +758,25 @@ class Analysis():
         """
 
         #read the whole MS Building Footprint file for Hawai'i
-        msbfd = gpd.read_file(f'{self.geo_path}Hawaii.geojson')
+        msbfd = gpd.read_file(f'{GEO_PATH}Hawaii.geojson')
         msbfd = msbfd.to_crs(epsg=32605)
 
         count = 0
         for region in ['SKona', 'NKona_SKohala', 'NHilo_Hamakua']:
 
-            if not os.path.exists(f'{self.geo_path}{region}_mapped_region'):
+            if not os.path.exists(f'{GEO_PATH}{region}_mapped_region'):
                 mapped_region = self._create_mapped_region_shpfiles(region)
             else:
-                mapped_region = gpd.read_file(f'{self.geo_path}{region}_mapped_region')
+                mapped_region = gpd.read_file(f'{GEO_PATH}{region}_mapped_region')
 
-            if not os.path.exists(f'{self.geo_path}MSBFD_{region}'):
+            if not os.path.exists(f'{GEO_PATH}MSBFD_{region}'):
                 #clip the MSBFD to the mapped region and count remaining buildings
                 #save clipped MSBFD file with other shapefiles for future use
                 print(f'Clipping {region}')
                 msbfd_clip = gpd.clip(msbfd, mapped_region)
-                msbfd_clip.to_file(f'{self.geo_path}MSBFD_{region}', driver='ESRI Shapefile')
+                msbfd_clip.to_file(f'{GEO_PATH}MSBFD_{region}', driver='ESRI Shapefile')
             else:
-                msbfd_clip = gpd.read_file(f'{self.geo_path}MSBFD_{region}')
+                msbfd_clip = gpd.read_file(f'{GEO_PATH}MSBFD_{region}')
 
             print(f'There are {len(msbfd_clip)} MS building footprints in {region}')
             count += len(msbfd_clip)
@@ -785,37 +803,34 @@ class Analysis():
         """
 
         #read the whole Hawai'i County parcel shapefile
-        parcels = gpd.read_file(f'{self.geo_path}Parcels/Parcels_-_Hawaii_County.shp')
+        parcels = gpd.read_file(f'{GEO_PATH}Parcels/Parcels_-_Hawaii_County.shp')
         parcels = parcels.to_crs(epsg=32605)
 
         #read the Hawai'i county Zoning shapefile
-        zoning = gpd.read_file(f'{self.geo_path}Zoning/Zoning_(Hawaii_County).shp')
+        zoning = gpd.read_file(f'{GEO_PATH}Zoning/Zoning_(Hawaii_County).shp')
         zoning = zoning.to_crs(epsg=32605)
 
         #read the state coastline shapefile
-        coast = gpd.read_file(f'{self.geo_path}Coastline/Coastline.shp')
+        coast = gpd.read_file(f'{GEO_PATH}Coastline/Coastline.shp')
         coast = coast[coast['isle'] == 'Hawaii'].reset_index(drop=True)
         coast = coast.to_crs(epsg=32605)
 
-        self.parcel_data = {}
         for region in ['SKona', 'NKona_SKohala', 'NHilo_Hamakua']:
 
-            matches = gpd.GeoDataFrame()
-
             #get the polygon defining the mapped region
-            if not os.path.exists(f'{self.geo_path}{region}_mapped_region'):
+            if not os.path.exists(f'{GEO_PATH}{region}_mapped_region'):
                 mapped_region = self._create_mapped_region_shpfiles(region)
             else:
-                mapped_region = gpd.read_file(f'{self.geo_path}{region}_mapped_region')
+                mapped_region = gpd.read_file(f'{GEO_PATH}{region}_mapped_region')
 
             #get the parcel polygons, clipped to the mapped region
-            if not os.path.exists(f'{self.geo_path}Parcels/Parcels_{region}'):
+            if not os.path.exists(f'{GEO_PATH}Parcels/Parcels_{region}'):
                 print(f'Clipping {region}')
                 parcels = gpd.clip(parcels, mapped_region)
-                parcels.to_file(f'{self.geo_path}Parcels/Parcels_{region}',\
+                parcels.to_file(f'{GEO_PATH}Parcels/Parcels_{region}',\
                                 driver='ESRI Shapefile')
             else:
-                parcels = gpd.read_file(f'{self.geo_path}Parcels/Parcels_{region}')
+                parcels = gpd.read_file(f'{GEO_PATH}Parcels/Parcels_{region}')
 
             print(f'There are {len(parcels)} parcels in {region}')
             parcel_polys = parcels.geometry.tolist()
@@ -829,10 +844,12 @@ class Analysis():
 
             #do the matching
             spatial_index = centroids.sindex
+            #need to have at least one column specified to avoid weird problem
+            #with multipolygons...
+            matches = gpd.GeoDataFrame(columns=['Parcel'])
             for idx, parcel in enumerate(parcel_polys):
                 #this will be the geometry column (has multipolygons so can't assign directly)
                 matches.loc[idx, 'Parcel'] = parcel
-
                 #find buildings whose centroids lie within the parcel
                 possible_matches_index = list(spatial_index.intersection(parcel.bounds))
                 possible_matches = centroids.iloc[possible_matches_index]
@@ -901,9 +918,6 @@ class Analysis():
                                     in matches.geometry]
             matches['Dist. (km)'] = matches['Dist. (km)'] / 1000
 
-            #put all this into class variable for further access
-            self.parcel_data[region] = matches
-
             #also save to a shapefile for this region
             matches.to_file(f'{self.analysis_path}{region}_parcel_occupation.shp',\
                             driver='ESRI Shapefile')
@@ -913,7 +927,7 @@ class Analysis():
             print('(Some parcels contain multiple buildings)')
 
 
-    def parcel_properties(self, from_file=True):
+    def parcel_properties(self):
         """
         Make a stacked histogram showing occupied and unoccupied parcels for
         each of the 3 geographies
@@ -921,10 +935,7 @@ class Analysis():
 
         _ = plt.figure()
         for n, region in enumerate(['SKona', 'NKona_SKohala', 'NHilo_Hamakua']):
-            if from_file:
-                data = gpd.read_file(f'{self.analysis_path}{region}_parcel_occupation.shp')
-            else:
-                data = self.parcel_data[region]
+            data = gpd.read_file(f'{self.analysis_path}{region}_parcel_occupation.shp')
             occupied = data[data['Occupied'] == '1']
             empty = data[data['Occupied'] == '0']
             plt.bar(n, len(occupied), color='0.5', edgecolor='k',\
@@ -947,7 +958,7 @@ class Analysis():
         return col_dict[col]
 
 
-    def parcel_plot(self, column, from_file=True, binwidth=200, xmax=5, ymax=1000):
+    def parcel_plot(self, column, binwidth=200, xmax=5, ymax=1000):
         """
         Make a multi-panel set of histograms showing n as a function of <column>,
         where <column> is a column in the parcel occupation file. For example,
@@ -958,11 +969,7 @@ class Analysis():
         fig, _ = plt.subplots(2, 2, figsize=(16, 8))
 
         for region, ax in zip(['SKona', 'NKona_SKohala', 'NHilo_Hamakua'], fig.axes):
-
-            if from_file:
-                data = gpd.read_file(f'{self.analysis_path}{region}_parcel_occupation.shp')
-            else:
-                data = self.parcel_data[region]
+            data = gpd.read_file(f'{self.analysis_path}{region}_parcel_occupation.shp')
             occupied = data[data['Occupied'] == '1']
             empty = data[data['Occupied'] == '0']
 
