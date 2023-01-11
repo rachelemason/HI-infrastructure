@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #postproc.py
-#REM 2023-01-09
+#REM 2023-01-10
 
 """
 Code for postprocessing of applied CNN models. Use in 'postproc' conda environment.
@@ -14,13 +14,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 from sklearn.metrics import classification_report
+import scipy
 from shapely.geometry import shape, MultiPolygon, Polygon
 import rasterio
 from rasterio.enums import Resampling
 from rasterio.features import rasterize
 from rasterio.merge import merge
 import fiona
-import gdal
+from osgeo import gdal
 import geopandas as gpd
 
 pd.set_option('display.precision', 2)
@@ -431,7 +432,7 @@ class VectorManips():
         return gdf
 
 
-    def vectorise(self, raster, minpix=25, road_files=None):
+    def vectorise(self, raster, buffers, minpix=25, road_files=None):
         """
         Vectorise a mosaic created by self.mosaic_and_crop(). Remove
         polygons containing fewer than <minpix> pixels, as they're probably
@@ -465,11 +466,11 @@ class VectorManips():
 
         #Apply negative then positive buffer, to remove spiky bits and disconnect
         #polygons that are connected by a thread (they are usually separate buildings)
-        gdf.geometry = gdf.geometry.buffer(-3)
+        gdf.geometry = gdf.geometry.buffer(buffers[0])
         #Delete polygons that get 'emptied' by negative buffering
         gdf = gdf[~gdf.geometry.is_empty]
         #Apply positive buffer to regain approx. original shape
-        gdf.geometry = gdf.geometry.buffer(3)
+        gdf.geometry = gdf.geometry.buffer(buffers[1])
         #If polygons have been split into multipolygons, explode into separate rows
         gdf = gdf.explode(index_parts=True).reset_index(drop=True)
 
@@ -488,7 +489,7 @@ class VectorManips():
 
         file_name = raster+'.shp'
         print(f"Writing {self.data_path}{file_name}")
-        gdf.to_file(f'{self.data_path}{file_name}TEMP', driver='ESRI Shapefile')
+        gdf.to_file(f'{self.data_path}{file_name}', driver='ESRI Shapefile')
 
 
 class Performance():
@@ -639,6 +640,9 @@ class Performance():
         then report IoU averaged over all.
         """
 
+        stats_df = pd.DataFrame()
+
+        #for each test region
         for alias, name in self.apply_to.items():
             labels = gpd.read_file\
             (f"{DATA_PATH.replace('features', 'buildings')}{name}_responses.shp")
@@ -648,33 +652,61 @@ class Performance():
             r_coords = [(p.x, p.y) for p in result.centroid]
 
             matches = {}
-            #need to visualize results in QGIS and adjust tolerances
+            #find building candidates within some tolerance of labelled buildings (true positives)
+            #each labelled building will end up with just one matched candidate (if any),
+            #even if there are multiple possibilities. This seems OK.
             for idx, coords in enumerate(l_coords):
                 for idx2, coords2 in enumerate(r_coords):
                     if abs(coords[0] - coords2[0]) <= tolerance\
                     and abs(coords[1] - coords2[1]) <= tolerance:
                         matches[idx] = idx2
-
             matched_labels = labels.iloc[list(matches.keys())].reset_index(drop=True)
-            matched_output = result.iloc[list(matches.values())].reset_index(drop=True)
+            matched_candidates = result.iloc[list(matches.values())].reset_index(drop=True)
 
-            iou = {}
+            #find all the labeled buildings that were not detected (false negatives)
+            temp = [idx for idx, _ in enumerate(l_coords) if idx not in matches]
+            unmatched_labels = labels.iloc[temp].reset_index(drop=True)
+
+            #find all the building candidates that don't correspond to labelled buildings
+            #false positives
+            temp = [idx for idx, _ in enumerate(r_coords) if idx not in matches.values()]
+            unmatched_candidates = result.iloc[temp].reset_index(drop=True)
+
+            #Calculate precision, recall and f1-score for each test region
+            #precision = TP/(TP+FP)
+            #recall = TP/(TP+FN)
+            tempdict = {}
+            tempdict['precision'] = len(matched_candidates)/(len(matched_candidates)\
+                                                             +len(unmatched_candidates))
+            tempdict['recall'] = len(matched_candidates)/(len(matched_candidates)\
+                                                          +len(unmatched_labels))
+            tempdict['f1-score'] = scipy.stats.hmean([tempdict['precision'], tempdict['recall']])
+
+            #Calculate IoU for each test region
+            iou = []
             for idx, row in matched_labels.iterrows():
                 poly1 = row['geometry']
-                poly2 = matched_output.loc[idx, 'geometry']
+                poly2 = matched_candidates.loc[idx, 'geometry']
                 intersect = poly1.intersection(poly2).area
                 union = poly1.union(poly2).area
-                iou[alias] = intersect / union
-            print(f'{alias}, {np.mean(iou[alias]):.2f}')
+                iou.append(intersect / union)
+            tempdict['iou'] = np.mean(iou)
+            print('***PROBABLY NEED TO EDIT IOU CALC TO INCLUDE FALSE POSITIVES/NEGATIVES***')
 
-            #Write out files for diagnostic purposes (check whether polygons matched well enough)
-            matched_labels.to_file(f'{vector_path}{alias}_matched_labels', driver='ESRI Shapefile')
-            matched_output.to_file(f'{vector_path}{alias}_matched_output', driver='ESRI Shapefile')
+            for name, stat in zip(list(tempdict.keys()), list(tempdict.values())):
+                stats_df.loc[alias, name] = stat
 
-        print(f'Mean: {np.mean(list(iou.values())):.2f}')
+            #Write out files for diagnostic purposes
+            for gdf, name in zip ([matched_labels, matched_candidates, unmatched_labels,\
+                                   unmatched_candidates], ['matched_labels', 'matched_candidates',\
+                                   'unmatched_labels', 'unmatched_candidates']):
+                if len(gdf) > 0:
+                    #Sometimes there are no unmatched X
+                    gdf.to_file(f'{vector_path}stats_{n_votes}votes/{alias}_{name}.shp',\
+                                driver='ESRI Shapefile')
 
-        #Once polygon matches have been made, should be straightforward to rasterize
-        #and calculate other stats as well
+        stats_df.loc['Mean'] = stats_df.mean()
+        display(stats_df)
 
 
 class Analysis():
