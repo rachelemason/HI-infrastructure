@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 #postproc.py
-#REM 2023-01-10
+#REM 2023-01-13
 
 """
-Code for postprocessing of applied CNN models. Use in 'postproc' conda environment.
+Code for postprocessing of applied CNN models. Use in 'postproc2' conda environment.
 """
 
 import os
@@ -20,6 +20,7 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.features import rasterize
 from rasterio.merge import merge
+from rasterio.mask import mask
 import fiona
 from osgeo import gdal
 import geopandas as gpd
@@ -332,7 +333,7 @@ class Ensemble():
                 temp.write(arr)
 
 
-    def mosaic_and_crop(self, tiles, shapefile, outname):
+    def mosaic_and_crop(self, tiles, shapefile, outname, n_votes):
         """
         Mosaic a set of 'edges_cleaned' tiles and crop to the boundaries of
         <shapefile>
@@ -356,10 +357,11 @@ class Ensemble():
             shapes = [feature["geometry"] for feature in shpf]
 
         with rasterio.open(f"{self.out_path}temp.tif") as f:
-            cropped, out_trans = rasterio.mask.mask(f, shapes, crop=True)
+            cropped, out_trans = mask(f, shapes, crop=True)
             meta = f.meta
 
         meta.update({"height": cropped.shape[1], "width": cropped.shape[2], "transform": out_trans})
+        print(f'Writing {self.out_path}{outname}.tif')
         with rasterio.open(f'{self.out_path}{outname}.tif', "w", **meta) as f:
             f.write(cropped)
 
@@ -461,9 +463,6 @@ class VectorManips():
         #remove too-small polygons
         gdf = gdf.loc[gdf.geometry.area >= minpix]
 
-        #Remove any interior holes
-        gdf.geometry = gdf.geometry.apply(lambda row: self._close_holes(row))
-
         #Apply negative then positive buffer, to remove spiky bits and disconnect
         #polygons that are connected by a thread (they are usually separate buildings)
         gdf.geometry = gdf.geometry.buffer(buffers[0])
@@ -473,23 +472,26 @@ class VectorManips():
         gdf.geometry = gdf.geometry.buffer(buffers[1])
         #If polygons have been split into multipolygons, explode into separate rows
         gdf = gdf.explode(index_parts=True).reset_index(drop=True)
+        
+        #Remove any interior holes
+        gdf.geometry = gdf.geometry.apply(lambda row: self._close_holes(row))
+
+        #Remove polygons that intersect roads (before getting the bounding rectangle)
+        if road_files:
+            gdf = self._remove_roads(gdf, road_files)
 
         #Get the oriented envelope/bounding rectangle
         boxes = gdf.apply(lambda row: row['geometry'].minimum_rotated_rectangle, axis=1)
         gdf.geometry = boxes
-
-        #Remove polygons that intersect roads
-        if road_files:
-            gdf = self._remove_roads(gdf, road_files)
 
         #Remove polygons that intersect the coastline
         gdf = self._remove_coastal_artefacts(gdf)
 
         print(f'There are {len(gdf)} building candidates in the {raster} map')
 
-        file_name = raster+'.shp'
-        print(f"Writing {self.data_path}{file_name}")
-        gdf.to_file(f'{self.data_path}{file_name}', driver='ESRI Shapefile')
+        file_name = f'{self.data_path}{raster}.shp'
+        print(f"Writing {file_name}")
+        gdf.to_file(file_name, driver='ESRI Shapefile')
 
 
 class Performance():
