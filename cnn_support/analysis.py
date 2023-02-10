@@ -7,24 +7,12 @@ Code for postprocessing of applied CNN models. Use in 'postproc2' conda environm
 """
 
 import os
-import random
-import glob
-import json
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
-from sklearn.metrics import classification_report
-import scipy
-from shapely.geometry import shape, MultiPolygon, Polygon, box
-import rasterio
-from rasterio.enums import Resampling
-from rasterio.features import rasterize
-from rasterio.merge import merge
-from rasterio.mask import mask
-import fiona
-from osgeo import gdal
 import geopandas as gpd
-from geocube.api.core import make_geocube
+from shapely.geometry import shape
+import rasterio
 
 pd.set_option('display.precision', 2)
 
@@ -292,13 +280,13 @@ class Analysis():
         _ = plt.figure()
         for n, region in enumerate(['SKona', 'NKona_SKohala', 'NHilo_Hamakua']):
             data = gpd.read_file(f'{self.analysis_path}{region}_parcel_occupation.shp')
-            
+
             print(f'There are {len(data)} occupied parcels in our map for {region}')
             print(data['County Bld'].unique())
             county_unknown = len(data[(data['Occupied'] == '1') & (data['County Bld'] == '0')])
             print(f'- {county_unknown} occupied parcels have no county building value')
             county_known = len(data[(data['Occupied'] == '0') & (data['County Bld'] == '1')])
-            print(f'- {county_known} parcels have county building values but are unoccupied according to our maps')
+            print(f'- {county_known} parcels have building values but are unoccupied according to our maps')
 
             occupied = data[data['Occupied'] == '1']
             empty = data[data['Occupied'] == '0']
