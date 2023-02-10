@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #postproc.py
-#REM 2023-01-13
+#REM 2023-02-10
 
 """
 Code for postprocessing of applied CNN models. Use in 'postproc2' conda environment.
@@ -154,6 +154,7 @@ class Ensemble():
 
             #get the relevant maps, for each test region
             for model_dir in self.model_set:
+                print(f'{model_dir}{start_from}_{region_name}.tif')
                 this_file = glob.glob(f'{model_dir}{start_from}_{region_name}.tif')[0]
                 this_array, meta = open_raster(this_file)
                 model_list.append(this_array)
@@ -239,70 +240,31 @@ class Ensemble():
         return arr
 
 
-    def trim_ensemble_tiles(self, tile_list, n_votes):
-        """
-        Trim ensemble tiles and LiDAR data to more manageable sizes, by removing
-        areas that are all NaN.
-        """
-
-        nanpath = '/data/gdcsdata/HawaiiMapping/Full_Backfilled_Tiles/'
-
-        for tile in tile_list:
-            #Get the original LiDAR for this tile, which tells us where no-data regions are
-            print(f'Filling in NaN values for {tile} from DSM')
-            with rasterio.open(f'{nanpath}{tile}/{tile}_backfilled_surface_1mres.tif') as f:
-                nans = f.read()
-                nan_meta = f.meta
-
-            #get the map for this tile
-            with rasterio.open(f'{self.out_path}ensemble_{n_votes}votes_{tile}.tif') as f:
-                arr = f.read()
-                profile = f.profile
-
-            arr[nans == nan_meta['nodata']] = -9999
-
-            #tiles 7, 12, 14, 15, 18, 19, 20, 21, 22, 31 can't/don't need to be cropped
-            tile_crop_dict = {'tile008': [3000, -1, 0, -1], 'tile009': [14000, -1, 0, 18000],\
-                              'tile016': [2500, -1, 0, 10000], 'tile024': [0, -1, 12500, -1],\
-                              'tile025': [0, -1, 0, 20000], 'tile030': [0, -1, 15000, -1]}
-            try:
-                idx = tile_crop_dict[tile]
-                nans = nans[:, idx[0]:idx[1], idx[2]:idx[3]]
-                arr = arr[:, idx[0]:idx[1], idx[2]:idx[3]]
-                plt.imshow(arr[0])
-                plt.show()
-                win = ((idx[0], idx[1]), (idx[2], idx[3]))
-                profile = profile.copy()
-                profile['width'] = arr.shape[2]
-                profile['height'] = arr.shape[1]
-                profile['transform'] = f.window_transform(win)
-            except KeyError:
-                pass
-
-            #TODO: turn this into symbolic links for tiles that didn't need trimming
-            print(f'Writing {tile} file')
-            with rasterio.open(f'{self.out_path}trimmed_{n_votes}votes_{tile}.tif',\
-                               'w', **profile) as f:
-                f.write(arr)
-
-
     def nans_and_edges(self, tiles, n_votes, edge_buf=30):
         """
-        Add NaNs to the ensemble for this tile (specified by <tile> and <n_votes> where
-        there are no data (as determined by the DSM for <tile>), and set a buffer around
-        edge regions to NaN. Writes an 'edges_cleaned' file for the ensemble for this tile.
-        This needs a LOT of memory to run on full tiles, especially those with a lot of NaN
-        pixels. 80Gb seems to work in all cases except tile009, which has to be cropped.
+        Use trimmed LiDAR data to set no-data regions of maps to NaN. Also, find the edges of
+        the LiDAR coverage where there are lots of spurious 'buildings', and set a buffer
+        around them to NaN. Writes an 'edges_cleaned' file for the ensemble for
+        this tile. This needs a LOT of memory to run on full tiles, especially those with
+        a lot of NaN pixels. 80Gb seems to work in all cases.
         """
+
+        nan_path = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_features/'
 
         for tile in tiles:
 
             print(f'Working on {tile}')
 
-            #get the (trimmed) map for this tile
-            with rasterio.open(f'{self.out_path}trimmed_{n_votes}votes_{tile}.tif') as f:
+            #get the map for this tile
+            with rasterio.open(f'{self.out_path}ensemble_{n_votes}votes_{tile}.tif') as f:
                 arr = f.read()
                 meta = f.meta
+
+            #get the LiDAR map and insert NaNs where LiDAR data are null
+            with rasterio.open(f'{nan_path}{tile}_1mDSM_trimmed.tif') as f:
+                nan_arr = f.read()
+
+            arr[nan_arr == -9999] = -9999
 
             #Now, work on extending the NaN regions to 'rub out' the edge effects
 
@@ -333,7 +295,7 @@ class Ensemble():
                 temp.write(arr)
 
 
-    def mosaic_and_crop(self, tiles, shapefile, outname, n_votes):
+    def mosaic_and_crop(self, tiles, shapefile, outname):
         """
         Mosaic a set of 'edges_cleaned' tiles and crop to the boundaries of
         <shapefile>
@@ -438,15 +400,18 @@ class VectorManips():
         """
         Vectorise a mosaic created by self.mosaic_and_crop(). Remove
         polygons containing fewer than <minpix> pixels, as they're probably
-        false positives. Write a shapefile with the name as the input tif,
-        <mosaic_name>.
-        TODO: update docstring
+        false positives. Apply a negative buffer then a positive one to remove
+        'spiky' bits and potentially also separate merged buildings. Fill
+        interior holes, then remove polygons that intersect with roads and
+        coastline. At this point, rasterize and save a file
+        ...
+        ...
         """
 
         with rasterio.open(f'{self.data_path}{raster}.tif', 'r') as f:
             arr = f.read()
             meta = f.meta
-
+        print(arr.shape)
         print(f'Vectorizing {raster}')
         polygons = []
         values = []
@@ -472,19 +437,36 @@ class VectorManips():
         gdf.geometry = gdf.geometry.buffer(buffers[1])
         #If polygons have been split into multipolygons, explode into separate rows
         gdf = gdf.explode(index_parts=True).reset_index(drop=True)
-        
-        #Remove any interior holes
+
+        #Remove any interior holes (do after buffering)
         gdf.geometry = gdf.geometry.apply(lambda row: self._close_holes(row))
 
-        #Remove polygons that intersect roads (before getting the bounding rectangle)
+        #Remove polygons that intersect roads (do before getting the bounding rectangle)
         if road_files:
             gdf = self._remove_roads(gdf, road_files)
+
+        #Remove polygons that intersect the coastline
+        gdf = self._remove_coastal_artefacts(gdf)
+
+        #Rasterize and save what should be a 'cleaner' raster than the input one
+        print(gdf.shape)
+        with rasterio.open(f'{self.data_path}temp.tif', 'w+', **meta) as out:
+            out_arr = out.read(1)
+
+            # this is where we create a generator of geom, value pairs to use in rasterizing
+            shapes = ((geom,value) for geom, value in zip(gdf.geometry, gdf.Values))
+
+            burned = rasterize(shapes=shapes, fill=0, out=out_arr, transform=out.transform)
+            print(type(burned))
+            print(burned)
+            print(np.unique(burned))
+            out.write_band(1, burned)
 
         #Get the oriented envelope/bounding rectangle
         boxes = gdf.apply(lambda row: row['geometry'].minimum_rotated_rectangle, axis=1)
         gdf.geometry = boxes
 
-        #Remove polygons that intersect the coastline
+        #Remove polygons that intersect the coastline (again, to clean up a bit more)
         gdf = self._remove_coastal_artefacts(gdf)
 
         print(f'There are {len(gdf)} building candidates in the {raster} map')
@@ -519,9 +501,9 @@ class Performance():
         geo = data.GetGeoTransform()
         geo = [geo[1], geo[2], geo[0], geo[4], geo[5], geo[3]]
         background = data.ReadAsArray()
-        mask = np.full(background.shape, np.nan)
+        masky = np.full(background.shape, np.nan)
         for _, polygon in enumerate(boundary_ds):
-            rasterize([polygon['geometry']], transform=geo, default_value=0, out=mask)
+            rasterize([polygon['geometry']], transform=geo, default_value=0, out=masky)
         return mask
 
 
@@ -565,21 +547,21 @@ class Performance():
 
             #create an array of the same shape as the applied model 'canvas'
             #in which everything outside the training dataset boundary/boundaries is NaN
-            mask = self.boundary_shp_to_mask(boundary_file, response_file)
+            masky = self.boundary_shp_to_mask(boundary_file, response_file)
             response_array, _ = open_raster(response_file)
 
             #insert the labelled responses into the array, inside the training boundaries
             #first, trim the edges off everything as they can contain weird stuff
-            mask = mask[trim:-trim, trim:-trim]
+            masky = masky[trim:-trim, trim:-trim]
             response_array = response_array[trim:-trim, trim:-trim]
             #avoid modifying existing dict
             get_stats_for = model[region_name]
             get_stats_for = get_stats_for[trim:-trim, trim:-trim]
-            mask[response_array != 0] = response_array[response_array != 0]
+            masky[response_array != 0] = response_array[response_array != 0]
 
             #flatten to 1D and remove NaNs
             predicted = get_stats_for.flatten()
-            expected = mask.flatten()
+            expected = masky.flatten()
             predicted = list(predicted[~(np.isnan(expected))])
             expected = list(expected[~(np.isnan(expected))])
 
@@ -636,7 +618,7 @@ class Performance():
             print(metric, f'{np.mean(values):.2f}')
 
 
-    def vector_stats(self, n_votes, vector_path, tolerance=1):
+    def vector_stats(self, n_votes, vector_path, tolerance, minpix=None):
         """
         Calculate Intersection over Union for test region ensemble maps,
         then report IoU averaged over all.
@@ -650,6 +632,8 @@ class Performance():
             (f"{DATA_PATH.replace('features', 'buildings')}{name}_responses.shp")
             result = gpd.read_file(f'{vector_path}ensemble_{n_votes}votes_{alias}.shp')
 
+            if minpix is not None:
+                labels = labels[labels.area >= minpix]
             l_coords = [(p.x, p.y) for p in labels.centroid]
             r_coords = [(p.x, p.y) for p in result.centroid]
 
@@ -709,318 +693,3 @@ class Performance():
 
         stats_df.loc['Mean'] = stats_df.mean()
         display(stats_df)
-
-
-class Analysis():
-    """
-    Calculate various numbers needed for the mapping paper
-    """
-
-    def __init__(self, map_path, analysis_path):
-        self.map_path = map_path
-        self.analysis_path = analysis_path
-
-
-    def total_area(self):
-        """
-        Find the area of the three geographies in sq. km by counting non-NaN pixels
-        in maps (each pix is 1m sq).
-        """
-
-        count = 0
-        for tif in ['SKona', 'NKona_SKohala', 'NHilo_Hamakua']:
-            with rasterio.open(f'{self.map_path}{tif}.tif') as f:
-                data = f.read()
-            area = np.sum(data >= 0) * 1e-6
-            print(f'Mapped area of {tif} is {area:.0f} sq. km')
-            count += area
-
-        print(f'Total mapped area is {count:.0f} sq. km')
-
-
-    def count_buildings(self):
-        """
-        Count the number of buildings in our maps for the three geographies. For
-        comparison with the number in the MSBFD (See count_msbfd)
-        """
-
-        count = 0
-        for mapfile in ['SKona', 'NKona_SKohala', 'NHilo_Hamakua']:
-            gdf = gpd.read_file(f'{self.map_path}{mapfile}/{mapfile}.shp')
-            print(f'There are {len(gdf)} buildings in our {mapfile} map')
-            count += len(gdf)
-        print(f'We identified {count} buildings in total')
-
-
-    def _create_mapped_region_shpfiles(self, region):
-        """
-        Helper method for count_msbfd and XX. Writes a shapefile that
-        contains a single multipolygon representing the outline of one
-        of our geographies, including the NaN (no-data) areas.
-        """
-
-        with rasterio.open(f'{self.map_path}{region}.tif', 'r') as f:
-            arr = f.read()
-            meta = f.meta
-
-            #we want to find the overall map outline, so set all buildings (1) to not-building (0)
-            arr[arr == 1] = 0
-
-            #TODO: this should be a utility function, or inherited method
-            print(f'Vectorizing {region}')
-            polygons = []
-            values = []
-            for vec in rasterio.features.shapes(arr.astype(np.int32), transform=meta['transform']):
-                polygons.append(shape(vec[0]))
-                values.append(vec[1])
-            mapped_region = gpd.GeoDataFrame(crs=meta['crs'], geometry=polygons)
-
-            #create a multipolygon showing the mapped region outline
-            mapped_region['Values'] = values
-            mapped_region = mapped_region[mapped_region['Values'] >= 0]
-            mapped_region = mapped_region.dissolve(by='Values').reset_index()
-
-            mapped_region.to_file(f'{GEO_PATH}{region}_mapped_region', driver='ESRI Shapefile')
-
-            return mapped_region
-
-
-    def count_msbfd(self):
-        """
-        Count the number of buildings in the MS Building Footprint Database that are
-        within the non-NAN areas of the three DST geographies
-        """
-
-        #read the whole MS Building Footprint file for Hawai'i
-        msbfd = gpd.read_file(f'{GEO_PATH}Hawaii.geojson')
-        msbfd = msbfd.to_crs(epsg=32605)
-
-        count = 0
-        for region in ['SKona', 'NKona_SKohala', 'NHilo_Hamakua']:
-
-            if not os.path.exists(f'{GEO_PATH}{region}_mapped_region'):
-                mapped_region = self._create_mapped_region_shpfiles(region)
-            else:
-                mapped_region = gpd.read_file(f'{GEO_PATH}{region}_mapped_region')
-
-            if not os.path.exists(f'{GEO_PATH}MSBFD_{region}'):
-                #clip the MSBFD to the mapped region and count remaining buildings
-                #save clipped MSBFD file with other shapefiles for future use
-                print(f'Clipping {region}')
-                msbfd_clip = gpd.clip(msbfd, mapped_region)
-                msbfd_clip.to_file(f'{GEO_PATH}MSBFD_{region}', driver='ESRI Shapefile')
-            else:
-                msbfd_clip = gpd.read_file(f'{GEO_PATH}MSBFD_{region}')
-
-            print(f'There are {len(msbfd_clip)} MS building footprints in {region}')
-            count += len(msbfd_clip)
-
-            #sanity check plot
-            _, ax = plt.subplots(figsize=(12, 8))
-            mapped_region.plot(color='cyan', ax=ax)
-            msbfd_clip.plot(color='black', ax=ax)
-            ax.set_axis_off()
-            plt.show()
-
-        print(f'There are {count} MS building footprints in our mapped areas')
-
-
-    def parcels_buildings(self):
-        """
-        For each parcel in the Hawai'i County shapefile, find out whether the centroid of
-        any of our mapped building rectangles falls within it. Create a dataframe containing
-        parcel polygon, occupation status (True if contains any building centroids), and
-        the area of the polygon in various units. Write results to shapefiles at self.analysis
-        path, one for each of the three study areas. This is intended to be run only once, as
-        it takes a couple of hours to get through everything.
-        See geoffboeing.com/2016/10/r-tree-spatial-index-python/
-        """
-
-        #read the whole Hawai'i County parcel shapefile
-        parcels = gpd.read_file(f'{GEO_PATH}Parcels/Parcels_-_Hawaii_County.shp')
-        parcels = parcels.to_crs(epsg=32605)
-
-        #read the Hawai'i county Zoning shapefile
-        zoning = gpd.read_file(f'{GEO_PATH}Zoning/Zoning_(Hawaii_County).shp')
-        zoning = zoning.to_crs(epsg=32605)
-
-        #read the state coastline shapefile
-        coast = gpd.read_file(f'{GEO_PATH}Coastline/Coastline.shp')
-        coast = coast[coast['isle'] == 'Hawaii'].reset_index(drop=True)
-        coast = coast.to_crs(epsg=32605)
-
-        for region in ['SKona', 'NKona_SKohala', 'NHilo_Hamakua']:
-
-            #get the polygon defining the mapped region
-            if not os.path.exists(f'{GEO_PATH}{region}_mapped_region'):
-                mapped_region = self._create_mapped_region_shpfiles(region)
-            else:
-                mapped_region = gpd.read_file(f'{GEO_PATH}{region}_mapped_region')
-
-            #get the parcel polygons, clipped to the mapped region
-            if not os.path.exists(f'{GEO_PATH}Parcels/Parcels_{region}'):
-                print(f'Clipping {region}')
-                parcels = gpd.clip(parcels, mapped_region)
-                parcels.to_file(f'{GEO_PATH}Parcels/Parcels_{region}',\
-                                driver='ESRI Shapefile')
-            else:
-                parcels = gpd.read_file(f'{GEO_PATH}Parcels/Parcels_{region}')
-
-            print(f'There are {len(parcels)} parcels in {region}')
-            parcel_polys = parcels.geometry.tolist()
-
-            #read our building map for the same region
-            buildings = gpd.read_file(f'{self.map_path}{region}/{region}.shp')
-            print(f'There are {len(buildings)} buildings in {region}')
-
-            #get building centroids, these points will be matched with parcels
-            centroids = buildings.geometry.centroid
-
-            #do the matching
-            spatial_index = centroids.sindex
-            #need to have at least one column specified to avoid weird problem
-            #with multipolygons...
-            matches = gpd.GeoDataFrame(columns=['Parcel'])
-            for idx, parcel in enumerate(parcel_polys):
-                #this will be the geometry column (has multipolygons so can't assign directly)
-                matches.loc[idx, 'Parcel'] = parcel
-                #find buildings whose centroids lie within the parcel
-                possible_matches_index = list(spatial_index.intersection(parcel.bounds))
-                possible_matches = centroids.iloc[possible_matches_index]
-                precise_matches = possible_matches[possible_matches.intersects(parcel)]
-                precise_matches = precise_matches.tolist()
-
-                #0 buildings --> Not developed; >=1 building --> Developed
-                #Encode as 0, 1 as can't save False, True in shapefiles
-                if len(precise_matches) == 0:
-                    matches.loc[idx, 'Occupied'] = '0'
-                else:
-                    matches.loc[idx, 'Occupied'] = '1'
-
-            #convert parcel (multi)polygons into a proper geometry column
-            matches['geometry'] = matches['Parcel']
-            matches.drop(columns=['Parcel'], inplace=True)
-
-            #add some area columns - different units for different purposes
-            matches['m^2'] = matches.geometry.area
-            matches['ft^2'] = matches.geometry.area * 10.7639
-            matches['ha'] =  matches['m^2'] / 10000
-            matches['acres'] =  matches['ft^2'] / 43560
-            matches = matches.set_crs(epsg=32605)
-
-            #record which parcels have buildings that are known to the county
-            matches['County Bldg'] = parcels['bldgvalue'].map({0: '0'}).fillna('1')
-
-            #now assign zoning to parcels
-            spatial_index = zoning.sindex
-            for idx, parcel in enumerate(parcel_polys):
-                possible_matches_index = list(spatial_index.intersection(parcel.bounds))
-                possible_matches = zoning.iloc[possible_matches_index]
-                precise_matches = possible_matches[possible_matches.intersects(parcel)]
-
-                if len(precise_matches) == 1:
-                    matches.loc[idx, 'Zoning'] = precise_matches['zone'].tolist()[0]
-                elif len(precise_matches) == 0:
-                    matches.loc[idx, 'Zoning'] = 'Unknown'
-                else:
-                    #often there are several matching zones for a parcel. Sometimes that's real,
-                    #but more often they seem to be spurious matches. I'm not sure what causes
-                    #that but the spurious matches often seem to be neighbours of the 'real' one.
-                    #Here we check the area of overlap for all matches, and only keep parcel-zone
-                    #matches that overlap by >100 sq. m.
-                    temp1 = []
-                    for num, _ in precise_matches.reset_index().iterrows():
-                        temp = gpd.GeoDataFrame({'geometry': [precise_matches.iloc[num].geometry],\
-                                                 'zone': [precise_matches.iloc[num].zone]},\
-                                                 crs='epsg:32605')
-                        myparcel = gpd.GeoDataFrame({'geometry':[parcel]}, crs='epsg:32605')
-                        overlay = gpd.overlay(temp, myparcel, how='intersection',\
-                                              keep_geom_type=False)
-                        if overlay.area[0] > 100:
-                            temp1.append(temp['zone'].tolist()[0])
-                    if len(temp1) == 1:
-                        matches.loc[idx, 'Zoning'] = temp1[0]
-                    elif len(temp1) >1:
-                        temp1 = '_'.join(list(set(temp1)))
-                        matches.loc[idx, 'Zoning'] = temp1
-                    else:
-                        matches.loc[idx, 'Zoning'] = 'Unknown'
-
-            #calculate distance from ocean - TAKES A WHILE
-            print('Calculating distance to coastline...')
-            matches['Dist. (km)'] = [parcel.distance(coast.geometry[0].boundary) for parcel\
-                                    in matches.geometry]
-            matches['Dist. (km)'] = matches['Dist. (km)'] / 1000
-
-            #also save to a shapefile for this region
-            matches.to_file(f'{self.analysis_path}{region}_parcel_occupation.shp',\
-                            driver='ESRI Shapefile')
-
-            open_parcels = len(matches[matches['Occupied'] == '0'])
-            print(f'There are approximately {open_parcels} undeveloped parcels in {region}')
-            print('(Some parcels contain multiple buildings)')
-
-
-    def parcel_properties(self):
-        """
-        Make a stacked histogram showing occupied and unoccupied parcels for
-        each of the 3 geographies
-        """
-
-        _ = plt.figure()
-        for n, region in enumerate(['SKona', 'NKona_SKohala', 'NHilo_Hamakua']):
-            data = gpd.read_file(f'{self.analysis_path}{region}_parcel_occupation.shp')
-            occupied = data[data['Occupied'] == '1']
-            empty = data[data['Occupied'] == '0']
-            plt.bar(n, len(occupied), color='0.5', edgecolor='k',\
-                    label='Occupied' if n == 0 else '')
-            plt.bar(n, len(empty), bottom=len(occupied), color='w', edgecolor='k',\
-                   label='Unoccupied' if n == 0 else '')
-        plt.legend()
-        plt.xticks([0, 1, 2], ['SKona', 'NKona_SKohala', 'NHilo_Hamakua'])
-        plt.ylabel('Number of parcels')
-
-
-    @classmethod
-    def _column_label(cls, col):
-        """
-        Helper method for self.parcel_plot. For a given column name, return the corresponding
-        x axis label
-        """
-
-        col_dict = {'ha': 'Area, ha', 'Dist. (km)': 'Distance from coastline, km'}
-        return col_dict[col]
-
-
-    def parcel_plot(self, column, binwidth=200, xmax=5, ymax=1000):
-        """
-        Make a multi-panel set of histograms showing n as a function of <column>,
-        where <column> is a column in the parcel occupation file. For example,
-        show number of parcels as a function of distance from the coast. One panel
-        per geography.
-        """
-
-        fig, _ = plt.subplots(2, 2, figsize=(16, 8))
-
-        for region, ax in zip(['SKona', 'NKona_SKohala', 'NHilo_Hamakua'], fig.axes):
-            data = gpd.read_file(f'{self.analysis_path}{region}_parcel_occupation.shp')
-            occupied = data[data['Occupied'] == '1']
-            empty = data[data['Occupied'] == '0']
-
-            bins = np.arange(0, xmax, binwidth)
-            ax.hist([occupied[column], empty[column]], bins=bins, stacked=True,\
-                    histtype='stepfilled', color=['0.5', 'white'], edgecolor='k',\
-                    label=['Occupied', 'Unoccupied'])
-
-            ax.legend()
-            ax.set_ylim(0, ymax)
-            ax.set_xlabel(self._column_label(column))
-            ax.set_ylabel('Number of parcels')
-            ax.set_title(f'{region}')
-
-        for n, ax in enumerate(fig.axes):
-            if n == 3:
-                ax.axis('off')
-
-        plt.tight_layout()
-        plt.savefig(f'{self.analysis_path}figures/parcels_by_coastal_distance.png', dpi=400)

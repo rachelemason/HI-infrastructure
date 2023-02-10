@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-12-06
+#REM 2022-01-30
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -173,6 +173,49 @@ class Utils():
                 do_the_work()
         else:
             do_the_work()
+            
+            
+    def trim_tiles(self, tile_list, in_path, in_suffix, out_path, out_suffix):
+        """
+        Trim tiles to more manageable sizes, by removing areas that are all NaN.
+        """
+        
+        #tiles 7, 12, 14, 15, 18, 19, 20, 21, 22, 31 can't/don't need to be cropped
+        tile_crop_dict = {'tile008': [3000, 25000, 0, 25000], 'tile009': [14000, 25000, 0, 18000],\
+                              'tile016': [2500, 25000, 0, 10000], 'tile024': [0, 25000, 12500, 25000],\
+                              'tile025': [0, 25000, 0, 20000], 'tile030': [0, 25000, 15000, 25000]}
+        for tile in tile_list:
+            
+            try:
+                idx = tile_crop_dict[tile]
+            except KeyError:
+                idx = None
+
+            if idx is not None:
+                print(f'Trimming {tile}')
+                with rasterio.open(f'{in_path}{tile}{in_suffix}') as f:
+                    arr = f.read()
+                    profile = f.profile
+                arr = arr[:, idx[0]:idx[1], idx[2]:idx[3]]
+                plt.imshow(arr[0])
+                plt.show()
+                win = ((idx[0], idx[1]), (idx[2], idx[3]))
+                profile = profile.copy()
+                profile['width'] = arr.shape[2]
+                profile['height'] = arr.shape[1]
+                profile['transform'] = f.window_transform(win)
+
+                print(f' --Writing {out_path}{tile}{out_suffix}')
+                with rasterio.open(f'{out_path}{tile}{out_suffix}',\
+                               'w', **profile) as f:
+                    f.write(arr)
+
+            else:
+                print(f'No trimming needed for {tile}')
+                print(f' --Creating symlink to {out_path}{tile}{out_suffix}')
+                os.symlink(f'{in_path}/{tile}{in_suffix}',\
+                           f'{out_path}{tile}{out_suffix}')
+
 
 
     @classmethod
@@ -216,7 +259,6 @@ class Utils():
                 do_the_work()
         else:
             do_the_work()
-
 
     @classmethod
     def tif_to_array(cls, tif, get_first_only=False):
