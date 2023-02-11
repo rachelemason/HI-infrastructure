@@ -396,23 +396,24 @@ class VectorManips():
         return gdf
 
 
-    def vectorise(self, raster, buffers, minpix=25, road_files=None):
+    def vectorise(self, in_map, buffers, minpix=25, road_files=None):
         """
         Vectorise a mosaic created by self.mosaic_and_crop(). Remove
         polygons containing fewer than <minpix> pixels, as they're probably
         false positives. Apply a negative buffer then a positive one to remove
         'spiky' bits and potentially also separate merged buildings. Fill
         interior holes, then remove polygons that intersect with roads and
-        coastline. At this point, rasterize and save a file
-        ...
-        ...
+        coastline. At this point, rasterize and save a file, <raster>_cleaner.tif
+        that probably has fewer artefacts than the input raster. Then, find the
+        minimum bounding box for each polygon, remove ones that now intersect with
+        coastline, and then save the result as <raster>.shp.
         """
 
-        with rasterio.open(f'{self.data_path}{raster}.tif', 'r') as f:
+        with rasterio.open(f'{self.data_path}{in_map}.tif', 'r') as f:
             arr = f.read()
             meta = f.meta
-        print(arr.shape)
-        print(f'Vectorizing {raster}')
+
+        print(f'Vectorizing {in_map}')
         polygons = []
         values = []
         for vec in rasterio.features.shapes(arr.astype(np.int32), transform=meta['transform']):
@@ -449,17 +450,11 @@ class VectorManips():
         gdf = self._remove_coastal_artefacts(gdf)
 
         #Rasterize and save what should be a 'cleaner' raster than the input one
-        print(gdf.shape)
-        with rasterio.open(f'{self.data_path}temp.tif', 'w+', **meta) as out:
-            out_arr = out.read(1)
-
-            # this is where we create a generator of geom, value pairs to use in rasterizing
+        meta.update({'compress': 'lzw'})
+        with rasterio.open(f'{self.data_path}{in_map}_cleaner.tif', 'w+', **meta) as out:
             shapes = ((geom,value) for geom, value in zip(gdf.geometry, gdf.Values))
-
-            burned = rasterize(shapes=shapes, fill=0, out=out_arr, transform=out.transform)
-            print(type(burned))
-            print(burned)
-            print(np.unique(burned))
+            burned = rasterize(shapes=shapes, fill=0, out_shape=out.shape, transform=out.transform)
+            burned[arr[0] < 0] = meta['nodata']
             out.write_band(1, burned)
 
         #Get the oriented envelope/bounding rectangle
@@ -469,9 +464,9 @@ class VectorManips():
         #Remove polygons that intersect the coastline (again, to clean up a bit more)
         gdf = self._remove_coastal_artefacts(gdf)
 
-        print(f'There are {len(gdf)} building candidates in the {raster} map')
+        print(f'There are {len(gdf)} building candidates in the {in_map} map')
 
-        file_name = f'{self.data_path}{raster}.shp'
+        file_name = f'{self.data_path}{in_map}.shp'
         print(f"Writing {file_name}")
         gdf.to_file(file_name, driver='ESRI Shapefile')
 
