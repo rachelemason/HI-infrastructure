@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #analysis.py
-#REM 2023-02-10
+#REM 2023-02-13
 
 """
 Code for postprocessing of applied CNN models. Use in 'postproc2' conda environment.
@@ -20,9 +20,10 @@ DATA_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_fea
 GEO_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/geo_data/'
 
 
-class Analysis():
+class Basics():
     """
-    Calculate various numbers needed for the mapping paper
+    Calculate various numbers related to the DST building maps and MS Building
+    Footprints Database, potentially needed for a paper about/based on the mapping.
     """
 
     def __init__(self, map_path, analysis_path):
@@ -63,7 +64,7 @@ class Analysis():
 
     def _create_mapped_region_shpfiles(self, region):
         """
-        Helper method for count_msbfd and XX. Writes a shapefile that
+        Helper method for count_msbfd and Parcels.parcels_buildings. Writes a shapefile that
         contains a single multipolygon representing the outline of one
         of our geographies, including the NaN (no-data) areas.
         """
@@ -76,7 +77,6 @@ class Analysis():
             #we want to find the overall map outline, so set all buildings (1) to not-building (0)
             arr[arr == 1] = 0
 
-            #TODO: this should be a utility function, or inherited method
             print(f'Vectorizing {region}')
             polygons = []
             values = []
@@ -133,6 +133,17 @@ class Analysis():
             plt.show()
 
         print(f'There are {count} MS building footprints in our mapped areas')
+
+
+class Parcels(Basics):
+    """
+    Calculate various numbers needed for the mapping paper
+    """
+
+    def __init__(self, map_path, analysis_path):
+        self.map_path = map_path
+        self.analysis_path = analysis_path
+        Basics.__init__(self, map_path, analysis_path)
 
 
     def parcels_buildings(self):
@@ -286,7 +297,7 @@ class Analysis():
             county_unknown = len(data[(data['Occupied'] == '1') & (data['County Bld'] == '0')])
             print(f'- {county_unknown} occupied parcels have no county building value')
             county_known = len(data[(data['Occupied'] == '0') & (data['County Bld'] == '1')])
-            print(f'- {county_known} parcels have building values but are unoccupied according to our maps')
+            print(f'- {county_known} parcels have bldg vals but are unoccupied in our maps')
 
             occupied = data[data['Occupied'] == '1']
             empty = data[data['Occupied'] == '0']
