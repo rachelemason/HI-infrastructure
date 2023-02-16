@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #cnn_support.py
-#REM 2022-01-30
+#REM 2022-02-15
 
 """
 Code to support use of the BFGN package (github.com/pgbrodrick/bfg-nets),
@@ -30,7 +30,11 @@ from matplotlib.patches import Rectangle
 import gdal
 import fiona
 import rasterio
+from rasterio.features import rasterize
+from rasterio.mask import mask
 from rasterio.enums import Resampling
+from shapely.geometry import shape
+import geopandas as gpd
 from sklearn.metrics import classification_report
 
 #BFGN relies on an old version of tensorflow that results in various
@@ -50,6 +54,7 @@ from bfgn.configuration import configs
 from bfgn.data_management import data_core, apply_model_to_data
 from bfgn.experiments import experiments
 
+GEO_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/geo_data/'
 
 def set_permutations_dict():
     """
@@ -87,10 +92,10 @@ class Utils():
         for nickname, shpfile in available_training_sets.items():
             if 'HBMain' not in shpfile: #avoid double-counting overlap with HBLower
                 geom = fiona.open(response_path+shpfile+'_responses.shp')
-                
+
                 with rasterio.open(feature_path+shpfile+'_hires_surface.tif') as src:
                     pixels = src.shape[0] * src.shape[1]
-                    
+
                 print(f"{nickname} contains {pixels} pixels and {len(geom)} features")
                 building_count += len(geom)
                 pixel_count += pixels
@@ -173,49 +178,34 @@ class Utils():
                 do_the_work()
         else:
             do_the_work()
-            
-            
-    def trim_tiles(self, tile_list, in_path, in_suffix, out_path, out_suffix):
+
+
+    def trim_tiles(self, tile_list, in_path, in_suffix, out_path, out_suffix, boundary_file):
         """
-        Trim tiles to more manageable sizes, by removing areas that are all NaN.
+        Crop tiles to shapefile boundaries to make at least some of them a more manageable size
         """
-        
-        #tiles 7, 12, 14, 15, 18, 19, 20, 21, 22, 31 can't/don't need to be cropped
-        tile_crop_dict = {'tile008': [3000, 25000, 0, 25000], 'tile009': [14000, 25000, 0, 18000],\
-                              'tile016': [2500, 25000, 0, 10000], 'tile024': [0, 25000, 12500, 25000],\
-                              'tile025': [0, 25000, 0, 20000], 'tile030': [0, 25000, 15000, 25000]}
+
         for tile in tile_list:
-            
-            try:
-                idx = tile_crop_dict[tile]
-            except KeyError:
-                idx = None
 
-            if idx is not None:
-                print(f'Trimming {tile}')
-                with rasterio.open(f'{in_path}{tile}{in_suffix}') as f:
-                    arr = f.read()
-                    profile = f.profile
-                arr = arr[:, idx[0]:idx[1], idx[2]:idx[3]]
-                plt.imshow(arr[0])
-                plt.show()
-                win = ((idx[0], idx[1]), (idx[2], idx[3]))
-                profile = profile.copy()
-                profile['width'] = arr.shape[2]
-                profile['height'] = arr.shape[1]
-                profile['transform'] = f.window_transform(win)
+            print(f'Cropping regions of {tile} that lie outside study region boundaries')
+            with fiona.open(boundary_file, "r") as shpf:
+                shapes = [feature["geometry"] for feature in shpf]
 
-                print(f' --Writing {out_path}{tile}{out_suffix}')
-                with rasterio.open(f'{out_path}{tile}{out_suffix}',\
-                               'w', **profile) as f:
-                    f.write(arr)
+            with rasterio.open(f'{in_path}{tile}/{tile}{in_suffix}') as f:
+                arr, out_trans = mask(f, shapes, crop=True)
+                profile = f.profile
 
-            else:
-                print(f'No trimming needed for {tile}')
-                print(f' --Creating symlink to {out_path}{tile}{out_suffix}')
-                os.symlink(f'{in_path}/{tile}{in_suffix}',\
-                           f'{out_path}{tile}{out_suffix}')
+            profile.update({"height": arr.shape[1], "width": arr.shape[2], "transform": out_trans,\
+                    'compress': 'lzw'})
 
+            #there are 2 tiles that lie in 2 study regions; need to give special names
+            if tile in ['tile008', 'tile014'] and 'NKonaSKohala' in boundary_file:
+                tile = tile+'a'
+            if tile in ['tile008', 'tile014'] and 'NHiloHamakua' in boundary_file:
+                tile = tile+'b'
+
+            with rasterio.open(f'{out_path}{tile}{out_suffix}', 'w', **profile) as f:
+                f.write(arr)
 
 
     @classmethod
@@ -284,7 +274,7 @@ class Utils():
     @classmethod
     def boundary_shp_to_mask(cls, boundary_file, background_file):
         """
-        Return a numpy array ('mask') with the same shape as <background_file>,
+        Return a numpy array ('masky') with the same shape as <background_file>,
         in which pixels within all polygons in <boundary_file> have values >=0,
         and pixels outside those polygons have value = np.nan.
         """
@@ -294,11 +284,11 @@ class Utils():
         geo = data.GetGeoTransform()
         geo = [geo[1], geo[2], geo[0], geo[4], geo[5], geo[3]]
         background = data.ReadAsArray()
-        mask = np.full(background.shape, np.nan)
+        masky = np.full(background.shape, np.nan)
         for _, polygon in enumerate(boundary_ds):
             rasterio.features.rasterize([polygon['geometry']], transform=geo,\
-                                        default_value=0, out=mask)
-        return mask
+                                        default_value=0, out=masky)
+        return masky
 
 
     @classmethod
@@ -436,12 +426,12 @@ class TrainingData(Utils):
             ax1.imshow(map_array)
 
         # show the boundary of the region(s) containing the training data
-        mask = self.boundary_shp_to_mask(boundary_file, feature_file)
+        masky = self.boundary_shp_to_mask(boundary_file, feature_file)
 
         # show where the labelled features are, within the training boundaries
         responses = gdal.Open(response_file, gdal.GA_ReadOnly).ReadAsArray()
-        mask[responses != 0] = responses[responses != 0] # put the buildings on the canvas
-        ax2.imshow(mask)
+        masky[responses != 0] = responses[responses != 0] # put the buildings on the canvas
+        ax2.imshow(masky)
 
         plt.tight_layout()
 
@@ -494,11 +484,101 @@ class TrainingData(Utils):
 
 class AppliedModel():
     """
-    Methods for visualizing applied models and calculating performance metrics.
+    Methods for applying models, visualizing applied models and calculating
+    performance metrics.
     """
 
     def __init__(self):
         pass
+
+
+    def _remove_roads(self, gdf, road_files):
+        """
+        Helper method for self.(). Reads roads from
+        <road_files> shapefiles, applies buffer, removes polygons
+        from <gdf> that overlap with buffered roads. Returns edited
+        <gdf>.
+        """
+
+        for file in road_files:
+            roads = gpd.read_file(file)
+            roads = roads[roads['island'].str.match('Hawaii')]
+            roads.geometry = roads.geometry.buffer(1)
+            gdf = gdf.loc[~gdf.intersects(roads.unary_union)].reset_index(drop=True)
+
+        return gdf
+
+
+    def _remove_coastal_artefacts(self, gdf):
+        """
+        Helper method for self.clean_coasts_and_roads(). Reads in coastline shapefile
+        and removes polygons from <gdf> that intersect with the coast. Same with county
+        TML/Parcel map outline. Returns edited <gdf>. Intended for removing coastal
+        artefacts.
+        """
+
+        #coastline as defined by coastline shapefile
+        coast = gpd.read_file(f'{GEO_PATH}Coastline/Coastline.shp')
+        coast = coast[coast['isle'] == 'Hawaii'].reset_index(drop=True)
+        coast = coast.to_crs(epsg=32605)
+
+        gdf = gdf.loc[gdf.within(coast.unary_union)].reset_index(drop=True)
+
+        #coastline as defined by County TMK map outline
+        try:
+            parcels = gpd.read_file(f'{GEO_PATH}Parcels/Parcels_outline.shp')
+        except fiona.errors.DriverError:
+            parcels = gpd.read_file(f'{GEO_PATH}Parcels/Parcels_-_Hawaii_County.shp')
+            parcels = parcels.to_crs(epsg=32605)
+            parcels['dissolve_by'] = 0
+            parcels = parcels.dissolve(by='dissolve_by').reset_index(drop=True)
+            parcels = parcels['geometry']
+            parcels.to_file(f'{GEO_PATH}Parcels/Parcels_outline.shp', driver='ESRI Shapefile')
+
+        gdf = gdf.loc[gdf.within(parcels.unary_union)].reset_index(drop=True)
+
+        return gdf
+
+
+    def clean_coasts_and_roads(self, tile, path, road_files):
+        """
+        Clean up coastal artefacts in an individual tile map by vectorizing the map and
+        rejecting polygons that don't lie wholly within (1) the coastline shapefile, and
+        (2) the outline of the County TMK/Parcel map. Also, reject polygons that overlap
+        with roads (in State DOT shapefiles). Then re-rasterize and save the 'cleaned' file.
+        """
+
+        with rasterio.open(f'{path}ndvi_cut_model_{tile}.tif') as f:
+            arr = f.read()
+            meta = f.meta
+
+        print(f'Vectorizing {path}ndvi_cut_model_{tile}.tif')
+        polygons = []
+        values = []
+        for vec in rasterio.features.shapes(arr.astype(np.int32), transform=meta['transform']):
+            polygons.append(shape(vec[0]))
+            values.append(vec[1])
+        gdf = gpd.GeoDataFrame(crs=meta['crs'], geometry=polygons)
+
+        gdf['Values'] = values
+
+        #Remove polygons that intersect roads (do before getting the bounding rectangle)
+        print('  - Removing polygons that intersect with roads')
+        gdf = self._remove_roads(gdf, road_files)
+
+        #Remove polygons that are outside the County parcel/TMK map outline, or outside the
+        #coastline
+        print('  - Removing polygons outside/overlapping the coast')
+        gdf = self._remove_coastal_artefacts(gdf)
+
+        #Rasterize and save what should be a 'cleaner' raster than the input one
+        print(f'  - Rasterizing and saving {path}cleaner_model_{tile}.tif')
+        meta.update({'compress': 'lzw'})
+        with rasterio.open(f'{path}cleaner_model_{tile}.tif', 'w+', **meta) as out:
+            shapes = ((geom,value) for geom, value in zip(gdf.geometry, gdf.Values))
+            burned = rasterize(shapes=shapes, fill=0, out_shape=out.shape, transform=out.transform)
+            burned[arr[0] < 0] = meta['nodata']
+            out.write_band(1, burned)
 
 
     def apply_model(self, config_file, application_file, outfile, method='threshold',\
@@ -612,21 +692,21 @@ class AppliedModel():
         _, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(16, 16))
 
         if responses is not None:
-            shape = gdal.Open(responses, gdal.GA_ReadOnly)
-            shape = shape.ReadAsArray()
-            shape = np.ma.masked_where(shape < 1.0, shape)
+            shp = gdal.Open(responses, gdal.GA_ReadOnly)
+            shp = shp.ReadAsArray()
+            shp = np.ma.masked_where(shp < 1.0, shp)
 
         #Show the applied model probabilities for class 2 over the whole area to which it
         #has been applied
         cbar = ax1.imshow(applied_model[1], cmap='GnBu_r')
         plt.colorbar(cbar, ax=ax1, shrink=0.6, pad=0.01)
         if responses is not None:
-            ax1.imshow(shape, alpha=0.7, cmap='Reds_r')
+            ax1.imshow(shp, alpha=0.7, cmap='Reds_r')
 
         #Convert probability map into binary classes using threshold
         ax2.imshow(ax2_data, cmap='Greys')
         if responses is not None:
-            ax2.imshow(shape, alpha=0.7, cmap='Reds_r')
+            ax2.imshow(shp, alpha=0.7, cmap='Reds_r')
         #Show the area to be zoomed into
         ax2.add_patch(Rectangle((zoom[2], zoom[0]), zoom[3]-zoom[2], zoom[1]-zoom[0],\
                                fill=False, edgecolor='r'))
@@ -635,7 +715,7 @@ class AppliedModel():
         ax3.imshow(ax2_data[zoom[0]:zoom[1], zoom[2]:zoom[3]], cmap='Greys')
         #Overplot responses (buildings), if available
         if responses is not None:
-            ax3.imshow(shape[zoom[0]:zoom[1], zoom[2]:zoom[3]], alpha=0.8, cmap='Reds_r')
+            ax3.imshow(shp[zoom[0]:zoom[1], zoom[2]:zoom[3]], alpha=0.8, cmap='Reds_r')
 
         #The original image for which everything was predicted (same subset/zoom region;
         #only show the first band if there are >1)
@@ -682,15 +762,15 @@ class AppliedModel():
         # create an array of the same shape as the applied model 'canvas'
         # in which everything outside the training dataset boundary/boundaries is NaN
         utils = Utils()
-        mask = utils.boundary_shp_to_mask(boundary_file, responses)
+        masky = utils.boundary_shp_to_mask(boundary_file, responses)
         response_array = utils.tif_to_array(responses)
 
         # insert the labelled responses into the array, inside the training boundaries
-        mask[response_array != 0] = response_array[response_array != 0]
+        masky[response_array != 0] = response_array[response_array != 0]
 
         # flatten to 1D and remove NaNs
         predicted = classes.flatten()
-        expected = mask.flatten()
+        expected = masky.flatten()
         predicted = list(predicted[~(np.isnan(expected))])
         expected = list(expected[~(np.isnan(expected))])
 
