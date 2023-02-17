@@ -36,13 +36,14 @@ from bfgn.data_management import data_core, apply_model_to_data
 from bfgn.experiments import experiments
 
 
-class Utils():
+class TrainingData():
     """
-    A few tools for file IO, file conversions, getting info from files, etc.
+    Methods for visualizing training data.
     """
 
     def __init__(self):
         pass
+
 
     @classmethod
     def count_buildings(cls, feature_path, response_path, available_training_sets):
@@ -68,15 +69,6 @@ class Utils():
         print(f'Total number of pixels = {pixel_count}')
 
 
-class TrainingData(Utils):
-    """
-    Methods for visualizing training data.
-    """
-
-    def __init__(self):
-        Utils.__init__(self)
-
-
     @classmethod
     def create_training_lists(cls, paths, all_training_sets, desired_training_set):
         """
@@ -98,7 +90,7 @@ class TrainingData(Utils):
         return parameter_combos
 
 
-class Loops(Utils):
+class Loops():
     """
     Methods for looping over BFGN parameter combinations
     """
@@ -111,8 +103,6 @@ class Loops(Utils):
         for key in iteration_data:
             setattr(self, key, iteration_data[key])
         self.settings_file = settings_file
-
-        Utils.__init__(self)
 
 
     @classmethod
