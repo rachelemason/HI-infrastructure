@@ -237,6 +237,6 @@ class Loops():
         experiment = experiments.Experiment(config)
         experiment.build_or_load_model(data_container=data_container)
 
-        print(f'Working on {application_file}')
+        print(f'Working on {application_file}, writing {outfile}')
         apply_model_to_data.apply_model_to_site(experiment.model, data_container,\
                                                 [application_file], outfile)
