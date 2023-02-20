@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #performance.py
-#REM 2022-02-17
+#REM 2022-02-20
 
 
 """
@@ -21,17 +21,21 @@ class MapManips():
     to classes, applying NDVI cut, etc.
     """
 
-    def __init__(self, model_output_root):
+    def __init__(self, model_output_root, feature_path, test_sets):
         self.model_output_root = model_output_root
+        self.feature_path = feature_path
+        self.test_sets = test_sets
 
 
-    def probabilities_to_classes(self, applied_model, threshold_val=0.85, nodata_val=-9999):
+    def probabilities_to_classes(self, applied_model, threshold_val=0.85, nodata_val=-9999,\
+                                verbose=True):
         """
         Converts the class probabilities in an applied model tif into
         binary classes using a probability threshold.
         """
 
-        print(f'Converting {applied_model} probabilities to classes')
+        if verbose:
+            print(f'Converting {applied_model} probabilities to classes')
 
         with rasterio.open(applied_model) as f:
             arr = f.read()
@@ -45,9 +49,40 @@ class MapManips():
         meta.update({'count': 1})
 
         outfile = applied_model.replace('applied', 'threshold')
-        print(f'  - Writing {outfile}')
+        if verbose:
+            print(f'  - Writing {outfile}')
         with rasterio.open(outfile, 'w', **meta) as f:
             f.write(output)
+
+
+    def ndvi_cut(self, model_dir, ndvi_threshold, verbose=True):
+        """
+        Apply an NDVI cut to each map array in model_dir that contains binary classes,
+        write to file. Finds the NDVI value for each map pixel, and if it is > ndvi_threshold,
+        the class is changed from 1 to 0. Purpose is to to exclude trees that have been
+        incorrectly identified as buildings.
+        """
+
+        for map_file in glob.glob(f'{model_dir}/*threshold*'):
+
+            #get the name of the test region
+            test_region = map_file.split('model_')[-1].replace('.tif', '')
+
+            #open the map
+            with rasterio.open(map_file, 'r') as f:
+                map_arr = f.read()
+                meta = f.meta
+
+            ndvi_file = f'{self.feature_path}{self.test_sets[test_region]}_ndvi_hires.tif'
+            with rasterio.open(ndvi_file, 'r') as f:
+                ndvi_arr = f.read()
+
+            map_arr[ndvi_arr > ndvi_threshold] = 0
+            outfile = map_file.replace('threshold', 'ndvi_cut')
+            if verbose:
+                print(f"Writing {outfile}")
+            with rasterio.open(f"{outfile}.tif", 'w', **meta) as f:
+                f.write(map_arr)
 
 
 class Evaluate():
