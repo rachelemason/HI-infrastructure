@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #performance.py
-#REM 2022-02-20
+#REM 2022-02-22
 
 
 """
@@ -12,10 +12,48 @@ from collections import defaultdict
 import glob
 import random
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
 import rasterio
 from rasterio.enums import Resampling
+from rasterio.features import rasterize
+import fiona
+from osgeo import gdal
+from sklearn.metrics import classification_report
+
+FEATURE_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_features/'
+RESPONSE_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_buildings/'
+BOUNDARY_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_boundaries/'
+
+
+class Utils():
+    """
+    Generic helper methods used by >1 class
+    """
+
+    def __init__(self, test_sets):
+        self.test_sets = test_sets
+
+
+    def _get_map_and_ref_data(self, map_file, test_region):
+        """
+        Helper method that just reads the map and labelled response
+        data for the specified region, clips the edges, and returns
+        both as 2D arrays
+        """
+
+        #open the map
+        with rasterio.open(map_file, 'r') as f:
+            map_arr = f.read()
+
+        #open the corresponding reference (labelled buildings) file
+        ref_file = f'{RESPONSE_PATH}{self.test_sets[test_region]}_responses.tif'
+        with rasterio.open(ref_file, 'r') as f:
+            ref_arr = f.read()
+
+        map_arr = map_arr[0]#[20:-20, 20:-20]
+        ref_arr = ref_arr[0]#[20:-20, 20:-20]
+
+        return map_arr, ref_arr
 
 
 class MapManips():
@@ -24,9 +62,8 @@ class MapManips():
     to classes, applying NDVI cut, etc.
     """
 
-    def __init__(self, model_output_root, feature_path, test_sets):
+    def __init__(self, model_output_root, test_sets):
         self.model_output_root = model_output_root
-        self.feature_path = feature_path
         self.test_sets = test_sets
 
 
@@ -77,7 +114,7 @@ class MapManips():
                 meta = f.meta
 
             #open the corresponding NDVI map
-            ndvi_file = f'{self.feature_path}{self.test_sets[test_region]}_ndvi_hires.tif'
+            ndvi_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_ndvi_hires.tif'
             with rasterio.open(ndvi_file, 'r') as f:
                 ndvi_arr = f.read()
 
@@ -90,38 +127,51 @@ class MapManips():
                 f.write(map_arr)
 
 
-class Evaluate():
+    def amcu_cut(self, model_dir, verbose=True):
+        """
+        Apply aMCU cuts to each NDVI cut map array in model_dir, write to file.
+        See self.ndvi_cut()
+        """
+
+        print('hey')
+        for map_file in glob.glob(f'{model_dir}/*ndvi_cut*'):
+            print(map_file)
+
+            #get the name of the test region
+            test_region = map_file.split('model_')[-1].replace('.tif', '')
+
+            #open the map
+            with rasterio.open(map_file, 'r') as f:
+                map_arr = f.read()
+
+            #open the aMCU file, resampling to same resolution as map array
+            amcu_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_amcu.tif'
+            with rasterio.open(amcu_file, 'r') as f:
+                meta = f.meta
+                amcu_arr = f.read(out_shape=(meta['count'], map_arr.shape[0], map_arr.shape[1]),\
+                                resampling=Resampling.bilinear)
+            plt.imshow(amcu_arr[2])
+            plt.show()
+
+            #set pixels with (aMCU[6] < 35) and (aMCU[2] > 900) to 0 (not-building)
+            map_arr[(amcu_arr[6] < 35) & (amcu_arr[2] > 900)] = 0
+            outfile = map_file.replace('ndvi_cut', 'amcu_cut')
+            meta.update({'count': map_arr.shape[0]})
+            if verbose:
+                print(f"Writing {outfile}")
+            with rasterio.open(f"{outfile}", 'w', **meta) as f:
+                f.write(map_arr)
+
+
+class Evaluate(Utils):
     """
     Methods for evaluating model performance and map quality and characteristics
     """
 
-    def __init__(self, model_output_root, feature_path, response_path, test_sets):
+    def __init__(self, model_output_root, test_sets):
         self.model_output_root = model_output_root
-        self.feature_path = feature_path
-        self.response_path = response_path
         self.test_sets = test_sets
-
-
-    def _get_map_and_ref_data(self, map_file, test_region):
-        """
-        Helper method that just reads the map and labelled response
-        data for the specified region, clips the edges, and returns
-        both as 2D arrays
-        """
-
-        #open the map
-        with rasterio.open(map_file, 'r') as f:
-            map_arr = f.read()
-
-        #open the corresponding reference (labelled buildings) file
-        ref_file = f'{self.response_path}{self.test_sets[test_region]}_responses.tif'
-        with rasterio.open(ref_file, 'r') as f:
-            ref_arr = f.read()
-
-        map_arr = map_arr[0][20:-20, 20:-20]
-        ref_arr = ref_arr[0][20:-20, 20:-20]
-
-        return map_arr, ref_arr
+        Utils.__init__(self, test_sets)
 
 
     @classmethod
@@ -169,10 +219,10 @@ class Evaluate():
             map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
 
             #open the NDVI file so we can get NDVI values for the candidates
-            ndvi_file = f'{self.feature_path}{self.test_sets[test_region]}_ndvi_hires.tif'
+            ndvi_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_ndvi_hires.tif'
             with rasterio.open(ndvi_file, 'r') as f:
                 ndvi_arr = f.read()
-            ndvi_arr = ndvi_arr[0][20:-20, 20:-20]
+            ndvi_arr = ndvi_arr[0]#[20:-20, 20:-20]
 
             #collect sample of NDVI from all pixels, for plotting
             all_ndvi.append([x for x in random.sample(ndvi_arr.flatten().tolist(), int(1e5))\
@@ -217,7 +267,7 @@ class Evaluate():
             map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
 
             #open the aMCU file, resampling to same resolution as map array
-            amcu_file = f'{self.feature_path}{self.test_sets[test_region]}_amcu.tif'
+            amcu_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_amcu.tif'
             with rasterio.open(amcu_file, 'r') as f:
                 meta = f.meta
                 amcu_arr = f.read(out_shape=(meta['count'], map_arr.shape[0], map_arr.shape[1]),\
@@ -275,7 +325,7 @@ class Evaluate():
             map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
 
             #open the aMCU file, resampling to same resolution as map array
-            amcu_file = f'{self.feature_path}{self.test_sets[test_region]}_amcu.tif'
+            amcu_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_amcu.tif'
             with rasterio.open(amcu_file, 'r') as f:
                 meta = f.meta
                 amcu_arr = f.read(out_shape=(meta['count'], map_arr.shape[0], map_arr.shape[1]),\
@@ -301,9 +351,7 @@ class Evaluate():
                 if test_region == 'KonaMauka':
                     kmx = np.where(((ref_arr == 0) & (map_arr == 1)), xdata, -9999)
                     kmy = np.where(((ref_arr == 0) & (map_arr == 1)), ydata, -9999)
-                    sns.kdeplot(x=kmx.flatten(), y=kmy.flatten(), clip=(0, 1000), ax=ax)
-                else:
-                    ax.scatter(kmx, kmy, color='r', s=1, alpha=0.3, label='Incorrect')
+                ax.scatter(kmx, kmy, color='r', s=1, alpha=0.3, label='Incorrect')
             else:
                 pass
 
@@ -318,3 +366,111 @@ class Evaluate():
             ax.set_title(test_region)
 
         plt.tight_layout()
+
+
+class Stats(Utils):
+    """
+    Methods for calculating and plotting performance statistics (map quality stats)
+    """
+
+    def __init__(self, model_output_root, test_sets):
+        self.model_output_root = model_output_root
+        self.test_sets = test_sets
+        Utils.__init__(self, test_sets)
+
+
+    @classmethod
+    def _boundary_shp_to_mask(cls, boundary_file, background_file):
+        """
+        Return a numpy array ('masky') with the same shape as <background_file>,
+        in which pixels within all polygons in <boundary_file> have values >=0,
+        and pixels outside those polygons have value = np.nan.
+        """
+
+        boundary_ds = fiona.open(boundary_file, 'r')
+        data = gdal.Open(background_file, gdal.GA_ReadOnly)
+        geo = data.GetGeoTransform()
+        geo = [geo[1], geo[2], geo[0], geo[4], geo[5], geo[3]]
+        background = data.ReadAsArray()
+        masky = np.full(background.shape, np.nan)
+        for _, polygon in enumerate(boundary_ds):
+            rasterio.features.rasterize([polygon['geometry']], transform=geo,\
+                                        default_value=0, out=masky)
+        return masky
+
+
+    def raster_stats(self, model_dir, map_kind='ndvi_cut'):
+        """
+        Given a model class prediction array and a set of responses, calculate precision,
+        recall, and f1-score for each class (currently assumes binary classes)
+        """
+
+        stats_dict = {}
+
+        #get the list of map files
+        map_list = glob.glob(f'{model_dir}/*{map_kind}*')
+
+        #for each test_region map
+        for map_file in map_list:
+
+            test_region = map_file.split('model_')[-1].replace('.tif', '')
+
+            #get the map and labelled response files for this test region
+            map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
+
+            #get the boundary mask (requires response file as opposed to array)
+            ref_file = f'{RESPONSE_PATH}{self.test_sets[test_region]}_responses.tif'
+            boundary_file = f'{BOUNDARY_PATH}{self.test_sets[test_region]}_boundary.shp'
+
+            #create an array of the same shape as the test region
+            #in which everything outside the test dataset boundary/boundaries is NaN
+            masko = self._boundary_shp_to_mask(boundary_file, ref_file)
+
+            # insert the labelled responses into the array, inside the training boundaries
+            masko[ref_arr != 0] = ref_arr[ref_arr != 0]
+
+            # flatten to 1D and remove NaNs
+            predicted = map_arr.flatten()
+            expected = masko.flatten()
+            predicted = list(predicted[~(np.isnan(expected))])
+            expected = list(expected[~(np.isnan(expected))])
+
+            # get performance metrics
+            stats_dict[test_region] = classification_report(expected, predicted, output_dict=True)
+
+        return stats_dict
+
+
+    @classmethod
+    def stats_plot(cls, stats_dict):
+        """
+        Make a 9-panel plot in which each panel shows precision, recall, and f1-score
+        for the test areas for a single model. At least as the models were orginally
+        set up, rows=data type (DSM, eigenvalues, hillshade), columns=window size
+        (16, 32, 64).
+        """
+
+        fig, _ = plt.subplots(3, 3, figsize=(12, 12))
+        for model, ax in zip(sorted(stats_dict.keys()), fig.axes):
+            precision = []
+            recall = []
+            f1score = []
+            regions = []
+            for region, stats in stats_dict[model].items():
+                if region != 'KonaMauka':
+                    precision.append((stats['1.0']['precision']))
+                    recall.append((stats['1.0']['recall']))
+                    f1score.append((stats['1.0']['f1-score']))
+                    regions.append(region)
+            x = range(len(precision))
+            ax.plot(x, precision, color='b', ms=6, marker='o', label='precision')
+            ax.plot(x, recall, color='r', ms=6, marker='o', label='recall')
+            ax.plot(x, f1score, color='k', ms=6, marker='o', label='f1-score')
+            ax.axhline(0.8, color='0.5', ls='--')
+            ax.legend()
+            ax.set_ylim(0, 1)
+            ax.set_xticks(x, regions, rotation=45)
+            ax.set_title(f'Model {model}')
+
+        plt.tight_layout()
+            
