@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #performance.py
-#REM 2022-02-23
+#REM 2022-02-24
 
 
 """
@@ -18,12 +18,19 @@ import rasterio
 from rasterio.enums import Resampling
 from rasterio.features import rasterize
 import fiona
+from shapely.geometry import shape, MultiPolygon, Polygon
 from osgeo import gdal
+import geopandas as gpd
 from sklearn.metrics import classification_report
+
 
 FEATURE_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_features/'
 RESPONSE_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_buildings/'
 BOUNDARY_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_boundaries/'
+GEO_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/geo_data/'
+ROAD_FILES = [f'{GEO_PATH}SDOT_roads/{f}' for f in ['state_routes_SDOT_epsg32605.shp',\
+                                                    'county_routes_SDOT_epsg32605.shp',\
+                                                    'ServiceAndOtherRoads_SDOT_epsg32605.shp']]
 
 
 class Utils():
@@ -164,6 +171,143 @@ class MapManips():
             meta.update({'count': map_arr.shape[0]})
             with rasterio.open(f"{outfile}", 'w', **meta) as f:
                 f.write(map_arr)
+
+
+    @classmethod
+    def _close_holes(cls, geom):
+        """
+        Helper method for self.vectorize_and_clean(). Removes interior holes from polygons.
+        See stackoverflow.com/questions/63317410/how-to-fill-holes-in-multi-polygons
+        -created-when-dissolving-geodataframe-with-ge
+        """
+
+        def remove_interiors(poly):
+            if poly.interiors:
+                return Polygon(list(poly.exterior.coords))
+            return poly
+
+        if isinstance(geom, MultiPolygon):
+            geos = gpd.GeoSeries([remove_interiors(g) for g in geom])
+            geoms = [g.area for g in geos]
+            big = geoms.pop(geoms.index(max(geoms)))
+            outers = geos.loc[~geos.within(big)].tolist()
+            if outers:
+                return MultiPolygon([big] + outers)
+            return Polygon(big)
+        if isinstance(geom, Polygon):
+            return remove_interiors(geom)
+
+
+    def _remove_roads(self, gdf):
+        """
+        Helper method for self.vectorise_and_clean(). Reads roads from
+        ROAD_FILES, applies buffer, removes polygons
+        from <gdf> that overlap with buffered roads. Returns edited
+        <gdf>.
+        """
+
+        for file in ROAD_FILES:
+            roads = gpd.read_file(file)
+            roads = roads[roads['island'].str.match('Hawaii')]
+            roads.geometry = roads.geometry.buffer(1)
+            gdf = gdf.loc[~gdf.intersects(roads.unary_union)].reset_index(drop=True)
+
+        return gdf
+
+
+    def _remove_coastal_artefacts(self, gdf):
+        """
+        Helper method for self.vectorize_and_clean(). Reads in coastline shapefile
+        and removes polygons from <gdf> that intersect with the coast. Same with county
+        TML/Parcel map outline. Returns edited <gdf>. Intended for removing coastal
+        artefacts.
+        """
+
+        #coastline as defined by coastline shapefile
+        coast = gpd.read_file(f'{GEO_PATH}Coastline/Coastline.shp')
+        coast = coast[coast['isle'] == 'Hawaii'].reset_index(drop=True)
+        coast = coast.to_crs(epsg=32605)
+
+        gdf = gdf.loc[gdf.within(coast.unary_union)].reset_index(drop=True)
+
+        #coastline as defined by County TMK map outline
+        try:
+            parcels = gpd.read_file(f'{GEO_PATH}Parcels/Parcels_outline.shp')
+        except fiona.errors.DriverError:
+            parcels = gpd.read_file(f'{GEO_PATH}Parcels/Parcels_-_Hawaii_County.shp')
+            parcels = parcels.to_crs(epsg=32605)
+            parcels['dissolve_by'] = 0
+            parcels = parcels.dissolve(by='dissolve_by').reset_index(drop=True)
+            parcels = parcels['geometry']
+            parcels.to_file(f'{GEO_PATH}Parcels/Parcels_outline.shp', driver='ESRI Shapefile')
+
+        gdf = gdf.loc[gdf.within(parcels.unary_union)].reset_index(drop=True)
+
+        return gdf
+
+
+    def vectorize_and_clean(self, map_file, out_file, buffers, minpix=25):
+        """
+        Clean up coastal artefacts in an individual tile/test region map by vectorizing
+        the map and rejecting polygons that don't lie wholly within (1) the coastline
+        shapefile, and (2) the outline of the County TMK/Parcel map. Also, reject polygons
+        that overlap with roads (in State DOT shapefiles). Then re-rasterize and save the
+        'cleaned' file.
+        """
+
+        with rasterio.open(map_file) as f:
+            arr = f.read()
+            meta = f.meta
+
+        print(f'Vectorizing {map_file}')
+        polygons = []
+        values = []
+        for vec in rasterio.features.shapes(arr.astype(np.int32), transform=meta['transform']):
+            polygons.append(shape(vec[0]))
+            values.append(vec[1])
+        gdf = gpd.GeoDataFrame(crs=meta['crs'], geometry=polygons)
+
+        gdf['Values'] = values
+
+        #remove polygons composed of NaNs or 0s (building == 1)
+        gdf = gdf[gdf['Values'] > 0]
+
+        #remove too-small polygons
+        gdf = gdf.loc[gdf.geometry.area >= minpix]
+
+        #Apply negative then positive buffer, to remove spiky bits and disconnect
+        #polygons that are connected by a thread (they are usually separate buildings)
+        gdf.geometry = gdf.geometry.buffer(buffers[0])
+        #Delete polygons that get 'emptied' by negative buffering
+        gdf = gdf[~gdf.geometry.is_empty]
+        #Apply positive buffer to regain approx. original shape
+        gdf.geometry = gdf.geometry.buffer(buffers[1])
+        #If polygons have been split into multipolygons, explode into separate rows
+        gdf = gdf.explode(index_parts=True).reset_index(drop=True)
+
+        #Remove any interior holes (do after buffering)
+        gdf.geometry = gdf.geometry.apply(lambda row: self._close_holes(row))
+
+        #Remove polygons that intersect roads (do before getting any bounding rectangle)
+        print('  - Removing polygons that intersect with roads')
+        gdf = self._remove_roads(gdf)
+
+        #Remove polygons that are outside the County parcel/TMK map outline, or outside the
+        #coastline
+        print('  - Removing polygons outside/overlapping the coast')
+        gdf = self._remove_coastal_artefacts(gdf)
+
+        #Rasterize and save what should be a 'cleaner' raster than the input one
+        print(f'  - Rasterizing and saving {out_file}')
+        meta.update({'compress': 'lzw'})
+        with rasterio.open(out_file, 'w+', **meta) as f:
+            shapes = ((geom,value) for geom, value in zip(gdf.geometry, gdf.Values))
+            burned = rasterize(shapes=shapes, fill=0, out_shape=f.shape, transform=f.transform)
+            burned[arr[0] < 0] = meta['nodata']
+            f.write_band(1, burned)
+
+        #Write the vector file as well
+        gdf.to_file(out_file.replace('.tif', '.shp'), driver='ESRI Shapefile')
 
 
 class Ensemble(MapManips):
