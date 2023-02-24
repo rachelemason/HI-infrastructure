@@ -138,41 +138,6 @@ class MapManips():
                 f.write(map_arr)
 
 
-    def amcu_cut(self, model_dir, verbose=True):
-        """
-        Apply aMCU cuts to each NDVI cut map array in model_dir, write to file.
-        See self.ndvi_cut()
-        """
-
-        for map_file in glob.glob(f'{model_dir}/*ndvi_cut*'):
-
-            for word in ['model_', 'votes_']:
-                if word in map_file:
-                    test_region = map_file.split(word)[-1].replace('.tif', '')
-
-            #open the map
-            with rasterio.open(map_file, 'r') as f:
-                map_arr = f.read()
-
-            #open the corresponding aMCU file
-            amcu_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_amcu_hires.tif'
-            with rasterio.open(amcu_file, 'r') as f:
-                meta = f.meta
-                amcu_arr = f.read()
-
-            #set pixels with (aMCU[6] < 35) and (aMCU[2] > 900) to 0 (not-building)
-            map_arr[0][(amcu_arr[6] < 35) & (amcu_arr[2] > 900)] = 0
-
-            outfile = map_file.replace('ndvi_cut', 'amcu_cut')
-            if verbose:
-                print(f"Writing {outfile}")
-                plt.imshow(map_arr[0])
-                plt.show()
-            meta.update({'count': map_arr.shape[0]})
-            with rasterio.open(f"{outfile}", 'w', **meta) as f:
-                f.write(map_arr)
-
-
     @classmethod
     def _close_holes(cls, geom):
         """
@@ -382,7 +347,6 @@ class Ensemble(MapManips):
 
         input_name = f"{self.ensemble_path}{ensemble_file}.tif"
         output_name = f"{self.ensemble_path}{out_file}.tif"
-        print(f'Creating {output_name}')
 
         with rasterio.open(input_name, 'r') as f:
             arr = f.read()
@@ -448,8 +412,9 @@ class Evaluate(Utils):
         #for each test_region map
         for map_file in glob.glob(f'{model_dir}/*threshold*'):
 
-            #get the name of the test region
-            test_region = map_file.split('model_')[-1].replace('.tif', '')
+            for word in ['model_', 'votes_']:
+                if word in map_file:
+                    test_region = map_file.split(word)[-1].replace('.tif', '')
 
             #open the map and response files
             map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
@@ -483,7 +448,7 @@ class Evaluate(Utils):
 
     def amcu_hist(self, model_dir):
         """
-        Produces a histogram of aMCU values for NDVI maps of test
+        Produces a histogram of aMCU values for cleaned maps of test
         regions, for a single model run. Shows values for all pixels (sample thereof),
         and for pixels correctly and incorrectly classified as buildings.
         """
@@ -495,10 +460,11 @@ class Evaluate(Utils):
         incorrect_amcu = defaultdict(list)
 
         #for each test_region map
-        for map_file in glob.glob(f'{model_dir}/*ndvi_cut*'):
+        for map_file in glob.glob(f'{model_dir}/*cleaner*tif'):
 
-            #get the name of the test region
-            test_region = map_file.split('model_')[-1].replace('.tif', '')
+            for word in ['model_', 'votes_']:
+                if word in map_file:
+                    test_region = map_file.split(word)[-1].replace('.tif', '')
 
             map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
 
@@ -537,6 +503,10 @@ class Evaluate(Utils):
         for band, ax in zip(all_amcu.keys(), fig.axes):
             self._histo(ax, [all_amcu[band], correct_amcu[band], incorrect_amcu[band]], bins,\
                         f'aMCU band{band}', xlims[band], legend=False)
+
+        for n, ax in enumerate(fig.axes):
+            if n >= len(glob.glob(f'{model_dir}/*cleaner*tif')):
+                ax.axis('off')
         plt.tight_layout()
 
 
@@ -548,15 +518,16 @@ class Evaluate(Utils):
         fig, _ = plt.subplots(3, 3, figsize=(16, 8))
 
         #get the list of map files, move KonaMauka to the front so it can be used as a reference
-        map_list = glob.glob(f'{model_dir}/*ndvi_cut*')
+        #the 3votes map for KonaMauka is hardwired, effort to fix that doesn't seem warranted
+        map_list = glob.glob(f'{model_dir}/*cleaner*.tif')
         map_list.insert(0, map_list.pop(map_list.index\
-                                        (f'{model_dir}/ndvi_cut_model_KonaMauka.tif')))
+                                        (f'{model_dir}cleaner_3votes_KonaMauka.tif')))
 
         #for each test_region map
         for map_file, ax in zip(map_list, fig.axes):
 
             #get the name of the test region
-            test_region = map_file.split('model_')[-1].replace('.tif', '')
+            test_region = map_file.split('votes_')[-1].replace('.tif', '')
 
             map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
 
@@ -587,9 +558,13 @@ class Evaluate(Utils):
                 if test_region == 'KonaMauka':
                     kmx = np.where(((ref_arr == 0) & (map_arr == 1)), xdata, -9999)
                     kmy = np.where(((ref_arr == 0) & (map_arr == 1)), ydata, -9999)
-                    #rng = np.random.default_rng(seed=0)
-                    #kmx = rng.choice(kmx, 1000, axis=0)
-                    #kmy = rng.choice(kmy, 1000, axis=0)
+                    rng = np.random.default_rng(seed=0)
+                    print('randomx')
+                    kmx = rng.choice(kmx, 5000, axis=0).flatten().tolist()
+                    kmx = [k for k in kmx if k > -9999]
+                    print('randomy')
+                    kmy = rng.choice(kmy, 5000, axis=0).flatten().tolist()
+                    kmy = [k for k in kmy if k > -9999]
                 ax.scatter(kmx, kmy, color='r', s=1, alpha=0.3, label='Incorrect')
             else:
                 pass
@@ -700,7 +675,8 @@ class Stats(Utils):
         (16, 32, 64).
         """
 
-        fig, _ = plt.subplots(3, 3, figsize=(12, 12))
+        rows = int(np.ceil(len(stats_dict) / 3))
+        fig, _ = plt.subplots(rows, 3, figsize=(12, 4*rows))
         for model, ax in zip(sorted(stats_dict.keys()), fig.axes):
             precision = []
             recall = []
@@ -720,7 +696,10 @@ class Stats(Utils):
             ax.legend()
             ax.set_ylim(0, 1)
             ax.set_xticks(x, regions, rotation=45, ha='right')
-            ax.set_title(f'Model {model}')
+            if 'ensemble' in plot_file:
+                ax.set_title(f'Ensemble {model}votes')
+            else:
+                ax.set_title(f'Model #{model}')
 
         for n, ax in enumerate(fig.axes):
             if n >= len(stats_dict):
