@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #performance.py
-#REM 2022-02-22
+#REM 2022-02-23
 
 
 """
@@ -8,6 +8,7 @@ Code for deriving mapping products from probability maps produced by
 run_models.py/RunModels.ipynb, and creating various diagnostic plots.
 """
 
+import os
 from collections import defaultdict
 import glob
 import random
@@ -50,8 +51,8 @@ class Utils():
         with rasterio.open(ref_file, 'r') as f:
             ref_arr = f.read()
 
-        map_arr = map_arr[0]#[20:-20, 20:-20]
-        ref_arr = ref_arr[0]#[20:-20, 20:-20]
+        map_arr = map_arr[0]
+        ref_arr = ref_arr[0]
 
         return map_arr, ref_arr
 
@@ -105,8 +106,9 @@ class MapManips():
 
         for map_file in glob.glob(f'{model_dir}/*threshold*'):
 
-            #get the name of the test region
-            test_region = map_file.split('model_')[-1].replace('.tif', '')
+            for word in ['model_', 'votes_']:
+                if word in map_file:
+                    test_region = map_file.split(word)[-1].replace('.tif', '')
 
             #open the map
             with rasterio.open(map_file, 'r') as f:
@@ -123,6 +125,8 @@ class MapManips():
             outfile = map_file.replace('threshold', 'ndvi_cut')
             if verbose:
                 print(f"Writing {outfile}")
+                plt.imshow(map_arr[0])
+                plt.show()
             with rasterio.open(f"{outfile}", 'w', **meta) as f:
                 f.write(map_arr)
 
@@ -133,34 +137,122 @@ class MapManips():
         See self.ndvi_cut()
         """
 
-        print('hey')
         for map_file in glob.glob(f'{model_dir}/*ndvi_cut*'):
-            print(map_file)
 
-            #get the name of the test region
-            test_region = map_file.split('model_')[-1].replace('.tif', '')
+            for word in ['model_', 'votes_']:
+                if word in map_file:
+                    test_region = map_file.split(word)[-1].replace('.tif', '')
 
             #open the map
             with rasterio.open(map_file, 'r') as f:
                 map_arr = f.read()
 
-            #open the aMCU file, resampling to same resolution as map array
-            amcu_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_amcu.tif'
+            #open the corresponding aMCU file
+            amcu_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_amcu_hires.tif'
             with rasterio.open(amcu_file, 'r') as f:
                 meta = f.meta
-                amcu_arr = f.read(out_shape=(meta['count'], map_arr.shape[0], map_arr.shape[1]),\
-                                resampling=Resampling.bilinear)
-            plt.imshow(amcu_arr[2])
-            plt.show()
+                amcu_arr = f.read()
 
             #set pixels with (aMCU[6] < 35) and (aMCU[2] > 900) to 0 (not-building)
-            map_arr[(amcu_arr[6] < 35) & (amcu_arr[2] > 900)] = 0
+            map_arr[0][(amcu_arr[6] < 35) & (amcu_arr[2] > 900)] = 0
+
             outfile = map_file.replace('ndvi_cut', 'amcu_cut')
-            meta.update({'count': map_arr.shape[0]})
             if verbose:
                 print(f"Writing {outfile}")
+                plt.imshow(map_arr[0])
+                plt.show()
+            meta.update({'count': map_arr.shape[0]})
             with rasterio.open(f"{outfile}", 'w', **meta) as f:
                 f.write(map_arr)
+
+
+class Ensemble(MapManips):
+    """
+    Methods for creating ensemble maps
+    """
+
+    def __init__(self, model_output_root, test_sets, ensemble_path):
+        self.model_output_root = model_output_root
+        self.test_sets = test_sets
+        self.ensemble_path = ensemble_path
+        MapManips.__init__(self, model_output_root, test_sets)
+
+
+    def create_ensemble(self, model_nums, region, map_type='threshold', show=True):
+        """
+        Create an ensemble map for a region, starting from a threshold,
+        applied, ndvi_cut, or anmcu_cut map, by taking the sum of each map pixel.
+        This means that the value of each pixel in the output map indicates the number
+        of input maps that classified that pixel as a building. Ensemble maps are
+        saved as tifs.
+        """
+
+        allowed_types = ['threshold', 'applied', 'ndvi_cut', 'amcu_cut']
+        if map_type not in allowed_types:
+            raise ValueError(f"<map_type> must be one of {allowed_types}")
+
+        print(f'Working on {region}')
+        model_list = []
+
+        #get the relevant maps, for each test region
+        for num in model_nums:
+            this_file = f'{self.model_output_root}combo_{num}/{map_type}_model_{region}.tif'
+            with rasterio.open(this_file, 'r') as f:
+                this_array = f.read()
+                meta = f.meta
+            model_list.append(this_array)
+
+            #find the SUM of the maps, which can be interpreted as the number of 'votes'
+            #for a candidate building pixel
+            combo = np.sum(model_list, axis=0)
+
+        if show:
+            plt.imshow(combo[0][20:-20, 20:-20])
+            plt.show()
+
+        #write the ndvi_cut map to file
+        os.makedirs(self.ensemble_path, exist_ok=True)
+        meta.update(count=1)
+        with rasterio.open(f"{self.ensemble_path}{map_type}_ensemble_{region}.tif", 'w',\
+                               **meta) as f:
+            f.write(combo)
+
+
+    def choose_cut_level(self, ensemble_file, n_votes, out_file, show=True):
+        """
+        For an ensemble created by self.create_ensemble() return a version converted to binary
+        classes using <n_votes>. The input ensemble will have pixel values = 0-n in steps of 1,
+        where n is the number of models that went into the ensemble. For example, an ensemble map
+        created from 5 individual models has pixel values like this:
+        0 - no models assigned class 'building' to this pixel
+        1 - 1 model assigned class 'building' to this pixel
+        2 - 2 models assigned class 'building' to this pixel
+        3 - 3 models assigned class 'building' to this pixel
+        4 - 4 models assigned class 'building' to this pixel
+        5 - 5 models assigned class 'building' to this pixel
+        Setting <n_votes>=4 will produce a model with binary building/not-building classes such
+        that each building will have received a positive classification from 4 input models.
+        This method must be used in order to produce a model that is understood by Performance.
+        performance_stats.
+        """
+
+        input_name = f"{self.ensemble_path}{ensemble_file}.tif"
+        output_name = f"{self.ensemble_path}{out_file}.tif"
+        print(f'Creating {output_name}')
+
+        with rasterio.open(input_name, 'r') as f:
+            arr = f.read()
+            meta = f.meta
+
+        arr[arr < n_votes] = 0
+        arr[arr >= n_votes] = 1
+
+        if show:
+            plt.imshow(arr[0])
+            plt.show()
+
+        with rasterio.open(output_name, 'w', **meta) as f:
+            f.write(arr)
 
 
 class Evaluate(Utils):
@@ -351,6 +443,9 @@ class Evaluate(Utils):
                 if test_region == 'KonaMauka':
                     kmx = np.where(((ref_arr == 0) & (map_arr == 1)), xdata, -9999)
                     kmy = np.where(((ref_arr == 0) & (map_arr == 1)), ydata, -9999)
+                    #rng = np.random.default_rng(seed=0)
+                    #kmx = rng.choice(kmx, 1000, axis=0)
+                    #kmy = rng.choice(kmy, 1000, axis=0)
                 ax.scatter(kmx, kmy, color='r', s=1, alpha=0.3, label='Incorrect')
             else:
                 pass
@@ -373,9 +468,10 @@ class Stats(Utils):
     Methods for calculating and plotting performance statistics (map quality stats)
     """
 
-    def __init__(self, model_output_root, test_sets):
+    def __init__(self, model_output_root, test_sets, analysis_path):
         self.model_output_root = model_output_root
         self.test_sets = test_sets
+        self.analysis_path = analysis_path
         Utils.__init__(self, test_sets)
 
 
@@ -408,12 +504,17 @@ class Stats(Utils):
         stats_dict = {}
 
         #get the list of map files
-        map_list = glob.glob(f'{model_dir}/*{map_kind}*')
+        map_list = glob.glob(f'{model_dir}/*{map_kind}*tif')
 
         #for each test_region map
         for map_file in map_list:
 
-            test_region = map_file.split('model_')[-1].replace('.tif', '')
+            if 'KonaMauka' in map_file:
+                continue
+
+            for word in ['model_', 'votes_']:
+                if word in map_file:
+                    test_region = map_file.split(word)[-1].replace('.tif', '')
 
             #get the map and labelled response files for this test region
             map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
@@ -425,6 +526,12 @@ class Stats(Utils):
             #create an array of the same shape as the test region
             #in which everything outside the test dataset boundary/boundaries is NaN
             masko = self._boundary_shp_to_mask(boundary_file, ref_file)
+
+            #trim outer 20 pix off each array
+            #(map edges are NaN; npix to trim should really be related to window size)
+            map_arr = map_arr[20:-20, 20:-20]
+            ref_arr = ref_arr[20:-20, 20:-20]
+            masko = masko[20:-20, 20:-20]
 
             # insert the labelled responses into the array, inside the training boundaries
             masko[ref_arr != 0] = ref_arr[ref_arr != 0]
@@ -441,8 +548,7 @@ class Stats(Utils):
         return stats_dict
 
 
-    @classmethod
-    def stats_plot(cls, stats_dict):
+    def stats_plot(self, stats_dict, plot_file):
         """
         Make a 9-panel plot in which each panel shows precision, recall, and f1-score
         for the test areas for a single model. At least as the models were orginally
@@ -456,7 +562,7 @@ class Stats(Utils):
             recall = []
             f1score = []
             regions = []
-            for region, stats in stats_dict[model].items():
+            for region, stats in sorted(stats_dict[model].items()):
                 if region != 'KonaMauka':
                     precision.append((stats['1.0']['precision']))
                     recall.append((stats['1.0']['recall']))
@@ -469,8 +575,13 @@ class Stats(Utils):
             ax.axhline(0.8, color='0.5', ls='--')
             ax.legend()
             ax.set_ylim(0, 1)
-            ax.set_xticks(x, regions, rotation=45)
+            ax.set_xticks(x, regions, rotation=45, ha='right')
             ax.set_title(f'Model {model}')
 
+        for n, ax in enumerate(fig.axes):
+            if n >= len(stats_dict):
+                ax.axis('off')
+
         plt.tight_layout()
+        plt.savefig(self.analysis_path+plot_file, dpi=400)
             
