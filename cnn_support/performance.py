@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #performance.py
-#REM 2022-02-24
+#REM 2022-02-28
 
 
 """
@@ -9,19 +9,22 @@ run_models.py/RunModels.ipynb, and creating various diagnostic plots.
 """
 
 import os
-from collections import defaultdict
 import glob
 import random
 import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import rasterio
-from rasterio.enums import Resampling
 from rasterio.features import rasterize
+from rasterstats import zonal_stats
 import fiona
 from shapely.geometry import shape, MultiPolygon, Polygon
 from osgeo import gdal
 import geopandas as gpd
-from sklearn.metrics import classification_report
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import RandomizedSearchCV, train_test_split
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+from scipy.stats import randint
 
 
 FEATURE_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_features/'
@@ -64,7 +67,37 @@ class Utils():
         return map_arr, ref_arr
 
 
-class MapManips():
+    @classmethod
+    def label_building_candidates(cls, labels, result, tolerance=8):
+        """
+        Given a gdf of building candidates and a gdf of labels,
+        returns gdfs containing correctly-labelled buildings and of
+        false positives.
+        """
+
+        l_coords = [(p.x, p.y) for p in labels.centroid]
+        r_coords = [(p.x, p.y) for p in result.centroid]
+
+        matches = {}
+        #find building candidates within some tolerance of labelled buildings (true positives)
+        #each labelled building will end up with just one matched candidate (if any),
+        #even if there are multiple possibilities. This seems OK. THIS IS NOT OK
+        for idx, coords in enumerate(l_coords):
+            for idx2, coords2 in enumerate(r_coords):
+                if abs(coords[0] - coords2[0]) <= tolerance\
+                and abs(coords[1] - coords2[1]) <= tolerance:
+                    matches[idx] = idx2
+        matched_candidates = result.iloc[list(matches.values())].reset_index(drop=True)
+
+        #find all the building candidates that don't correspond to labelled buildings
+        #false positives
+        temp = [idx for idx, _ in enumerate(r_coords) if idx not in matches.values()]
+        unmatched_candidates = result.iloc[temp].reset_index(drop=True)
+
+        return matched_candidates, unmatched_candidates
+
+
+class MapManips(Utils):
     """
     Methods for manipulating applied model 'maps' - converting probabilities
     to classes, applying NDVI cut, etc.
@@ -73,6 +106,8 @@ class MapManips():
     def __init__(self, model_output_root, test_sets):
         self.model_output_root = model_output_root
         self.test_sets = test_sets
+        self.classified_candidates = None #(defined in classify_all_candidate_buildings)
+        Utils.__init__(self, test_sets)
 
 
     def probabilities_to_classes(self, applied_model, threshold_val=0.85, nodata_val=-9999,\
@@ -275,6 +310,118 @@ class MapManips():
         gdf.to_file(out_file.replace('.tif', '.shp'), driver='ESRI Shapefile')
 
 
+    def classify_all_candidate_buildings(self, model_dir):
+        """
+        Create a gdf, self.classified candidates, containing polygons that are genuine
+        buildings (Value=1) and false positives (Value=0), respectively. Add columns
+        containing the mean aMCU (all bands) for each candidate.
+        """
+
+        self.classified_candidates = gpd.GeoDataFrame()
+
+        #get the list of map files
+        map_list = glob.glob(f'{model_dir}/*cleaner*.tif')
+
+        #for each test_region map
+        for map_file in map_list:
+
+            #get the name of the test region
+            test_region = map_file.split('votes_')[-1].replace('.tif', '')
+            print(test_region)
+
+            #read the map as a shapefile, containing 1 polygon per building candidate
+            map_gdf = gpd.read_file(map_file.replace('.tif', '.shp'))
+
+            #read the labelled response file for the test area, also as shapefile
+            labels_gdf = gpd.read_file\
+                        (f'{RESPONSE_PATH}{self.test_sets[test_region]}_responses.shp')
+
+            #open the aMCU file for the test region
+            amcu_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_amcu_hires.tif'
+            with rasterio.open(amcu_file, 'r') as f:
+                affine = f.transform
+                amcu_arr = f.read()
+
+            #find building candidates that have been correctly and incorrectly identified
+            correct, incorrect = self.label_building_candidates(labels_gdf, map_gdf)
+            correct['Values'] = 1
+            incorrect['Values'] = 0
+
+            def poly_stats(building_df, amcu_arr, affine):
+                #find mean of aMCU raster within each building candidate in gdf (all bands)
+
+                #buffer the polygon as edge pixels may not represent its 'real' aMCU values
+                building_df.geometry = building_df.geometry.buffer(-1)
+
+                gdf = building_df.copy()
+                for band in range(7):
+                    df_zonal_stats = pd.DataFrame(zonal_stats(building_df, amcu_arr[band],\
+                                                                  affine=affine))
+                    gdf = pd.concat([gdf, df_zonal_stats['mean']], axis=1).reset_index(drop=True)
+                    gdf.rename(columns={'mean': f'band{band} mean'}, inplace=True)
+
+                return gdf
+
+            #KonaMauka doesn't have any correctly-identified buildings
+            #(it only has 1 real one and that is missed)
+            if 'KonaMauka' not in test_region:
+                correct = poly_stats(correct, amcu_arr, affine)
+                self.classified_candidates = pd.concat([self.classified_candidates, correct])
+
+            incorrect = poly_stats(incorrect, amcu_arr, affine)
+            self.classified_candidates = pd.concat([self.classified_candidates, incorrect])
+
+        self.classified_candidates.reset_index(inplace=True, drop=True)
+
+
+    def classify_with_rf_and_amcu(self):
+        """
+        h/t www.datacamp.com/tutorial/random-forests-classifier-python
+        """
+
+        #get X (feature) and y (response/target) variables
+
+        X = self.classified_candidates.drop(columns=['geometry', 'Values'])
+        y = self.classified_candidates['Values']
+
+        #split the data into training and test sets
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
+
+        #define some hyperparameters to tune
+        param_dist = {'n_estimators': randint(50,500),
+              'max_depth': randint(1,20)}
+
+        #create a random forest classifier
+        randf = RandomForestClassifier()
+
+        #use random search to find the best hyperparameters
+        rand_search = RandomizedSearchCV(randf, param_distributions = param_dist, n_iter=5, cv=5)
+
+        #fit the random search object to the data
+        rand_search.fit(X_train, y_train)
+
+        #get the best-performing model
+        best_rf = rand_search.best_estimator_
+
+        #print the best hyperparameters
+        print('Best hyperparameters:',  rand_search.best_params_)
+
+        #predict classes for test data
+        y_pred = best_rf.predict(X_test)
+
+        #show the classification report
+        print(classification_report(y_test, y_pred))
+
+        #show the confusion matrix
+        cmat = confusion_matrix(y_test, y_pred)
+        ConfusionMatrixDisplay(confusion_matrix=cmat).plot()
+
+        #show the feature importances
+        #feature_importances = pd.Series(best_rf.feature_importances_, index=X_train.columns).\
+        #                     sort_values(ascending=False)
+        #feature_importances.plot.bar();
+
+
 class Ensemble(MapManips):
     """
     Methods for creating ensemble maps
@@ -377,7 +524,7 @@ class Evaluate(Utils):
     @classmethod
     def _histo(cls, ax, data, bins, xtext, xlims, xlinepos=None, legend=True):
         """
-        Helper method for self.ndvi_hist and self.amcu_hist. Puts the data into
+        Helper method for self.ndvi_hist. Puts the data into
         the histogram and does some axis stuff.
         """
 
@@ -423,7 +570,7 @@ class Evaluate(Utils):
             ndvi_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_ndvi_hires.tif'
             with rasterio.open(ndvi_file, 'r') as f:
                 ndvi_arr = f.read()
-            ndvi_arr = ndvi_arr[0]#[20:-20, 20:-20]
+            ndvi_arr = ndvi_arr[0]
 
             #collect sample of NDVI from all pixels, for plotting
             all_ndvi.append([x for x in random.sample(ndvi_arr.flatten().tolist(), int(1e5))\
@@ -444,70 +591,6 @@ class Evaluate(Utils):
         _, ax = plt.subplots(1, 1, figsize=[6, 6])
         self._histo(ax, [all_ndvi, correct_ndvi, incorrect_ndvi], bins, 'NDVI',\
                     [-0.5, 1.0], ndvi_threshold)
-
-
-    def amcu_hist(self, model_dir):
-        """
-        Produces a histogram of aMCU values for cleaned maps of test
-        regions, for a single model run. Shows values for all pixels (sample thereof),
-        and for pixels correctly and incorrectly classified as buildings.
-        """
-
-        print(f'Working on ndvi_cut maps from {model_dir}')
-
-        all_amcu = defaultdict(list)
-        correct_amcu = defaultdict(list)
-        incorrect_amcu = defaultdict(list)
-
-        #for each test_region map
-        for map_file in glob.glob(f'{model_dir}/*cleaner*tif'):
-
-            for word in ['model_', 'votes_']:
-                if word in map_file:
-                    test_region = map_file.split(word)[-1].replace('.tif', '')
-
-            map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
-
-            #open the aMCU file, resampling to same resolution as map array
-            amcu_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_amcu.tif'
-            with rasterio.open(amcu_file, 'r') as f:
-                meta = f.meta
-                amcu_arr = f.read(out_shape=(meta['count'], map_arr.shape[0], map_arr.shape[1]),\
-                                resampling=Resampling.bilinear)
-
-            #for each of the 7 aMCU bands
-            for band in range(amcu_arr.shape[0]):
-
-                #collect sample of aMCU from all pixels, for plotting
-                all_amcu[band].append([x for x in random.sample(amcu_arr[band].flatten().tolist(),\
-                                                          int(1e5)) if x > -9999])
-
-                #make arrays of candidates that are and aren't buildings, based on labeled refs
-                correct = np.where(((ref_arr == 1) & (map_arr == 1)), amcu_arr[band], -9999)
-                incorrect = np.where(((ref_arr == 0)  & (map_arr == 1)), amcu_arr[band], -9999)
-
-                correct_amcu[band].append([x for x in correct.flatten().tolist() if x > -9999])
-                incorrect_amcu[band].append([x for x in incorrect.flatten().tolist() if x > -9999])
-
-        for band in all_amcu.keys():
-            all_amcu[band] = [x for y in all_amcu[band] for x in y]
-        for band in correct_amcu.keys():
-            correct_amcu[band] = [x for y in correct_amcu[band] for x in y]
-        for band in incorrect_amcu.keys():
-            incorrect_amcu[band] = [x for y in incorrect_amcu[band] for x in y]
-
-        fig, _ = plt.subplots(3, 3, figsize=(10, 10))
-        xlims = {0: [-500, 2500], 1: [-500, 3000], 2: [-3000, 2000], 3: [-200, 600],\
-                 4: [-200, 600], 5: [-200, 600], 6: [-200, 600]}
-        bins=50
-        for band, ax in zip(all_amcu.keys(), fig.axes):
-            self._histo(ax, [all_amcu[band], correct_amcu[band], incorrect_amcu[band]], bins,\
-                        f'aMCU band{band}', xlims[band], legend=False)
-
-        for n, ax in enumerate(fig.axes):
-            if n >= len(glob.glob(f'{model_dir}/*cleaner*tif')):
-                ax.axis('off')
-        plt.tight_layout()
 
 
     def amcu_scatter(self, model_dir, xband, yband, lims, incorrect):
@@ -531,12 +614,10 @@ class Evaluate(Utils):
 
             map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
 
-            #open the aMCU file, resampling to same resolution as map array
-            amcu_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_amcu.tif'
+            #open the aMCU file
+            amcu_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_amcu_hires.tif'
             with rasterio.open(amcu_file, 'r') as f:
-                meta = f.meta
-                amcu_arr = f.read(out_shape=(meta['count'], map_arr.shape[0], map_arr.shape[1]),\
-                                resampling=Resampling.bilinear)
+                amcu_arr = f.read()
 
             #get the aMCU bands that go on the x and y axes
             xdata = amcu_arr[xband]
@@ -559,20 +640,16 @@ class Evaluate(Utils):
                     kmx = np.where(((ref_arr == 0) & (map_arr == 1)), xdata, -9999)
                     kmy = np.where(((ref_arr == 0) & (map_arr == 1)), ydata, -9999)
                     rng = np.random.default_rng(seed=0)
-                    print('randomx')
-                    kmx = rng.choice(kmx, 5000, axis=0).flatten().tolist()
-                    kmx = [k for k in kmx if k > -9999]
-                    print('randomy')
-                    kmy = rng.choice(kmy, 5000, axis=0).flatten().tolist()
-                    kmy = [k for k in kmy if k > -9999]
+                    kmx = rng.choice(kmx, 10000, axis=0)
+                    kmy = rng.choice(kmy, 10000, axis=0)
+                    kmx = np.where((kmy > -9999), kmx, -9999)
+                    kmy = np.where((kmx > -9999), kmy, -9999)
+                    kmx = [k for k in kmx.flatten().tolist() if k > -9999]
+                    kmy = [k for k in kmy.flatten().tolist() if k > -9999]
                 ax.scatter(kmx, kmy, color='r', s=1, alpha=0.3, label='Incorrect')
             else:
                 pass
 
-            ax.hlines(y=3, xmin=0, xmax=900, color='limegreen', ls='--')
-            ax.hlines(y=35, xmin=900, xmax=975, color='limegreen', ls='--')
-            ax.vlines(900, ymin=3, ymax=35, color='limegreen', ls='--')
-            ax.vlines(975, ymin=0, ymax=35, color='limegreen', ls='--')
             ax.set_xlim(lims[0])
             ax.set_ylim(lims[1])
             ax.set_xlabel(f'aMCU band {xband}')
