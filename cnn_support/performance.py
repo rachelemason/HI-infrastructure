@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #performance.py
-#REM 2022-02-28
+#REM 2022-03-03
 
 
 """
@@ -41,11 +41,11 @@ class Utils():
     Generic helper methods used by >1 class
     """
 
-    def __init__(self, test_sets):
-        self.test_sets = test_sets
+    def __init__(self, all_labelled_data):
+        self.all_labelled_data = all_labelled_data
 
 
-    def _get_map_and_ref_data(self, map_file, test_region):
+    def _get_map_and_ref_data(self, map_file, region):
         """
         Helper method that just reads the map and labelled response
         data for the specified region, clips the edges, and returns
@@ -57,7 +57,7 @@ class Utils():
             map_arr = f.read()
 
         #open the corresponding reference (labelled buildings) file
-        ref_file = f'{RESPONSE_PATH}{self.test_sets[test_region]}_responses.tif'
+        ref_file = f'{RESPONSE_PATH}{self.all_labelled_data[region]}_responses.tif'
         with rasterio.open(ref_file, 'r') as f:
             ref_arr = f.read()
 
@@ -88,11 +88,13 @@ class Utils():
                 and abs(coords[1] - coords2[1]) <= tolerance:
                     matches[idx] = idx2
         matched_candidates = result.iloc[list(matches.values())].reset_index(drop=True)
+        matched_candidates['Values'] = 1
 
         #find all the building candidates that don't correspond to labelled buildings
         #false positives
         temp = [idx for idx, _ in enumerate(r_coords) if idx not in matches.values()]
         unmatched_candidates = result.iloc[temp].reset_index(drop=True)
+        unmatched_candidates['Values'] = 0
 
         return matched_candidates, unmatched_candidates
 
@@ -103,11 +105,13 @@ class MapManips(Utils):
     to classes, applying NDVI cut, etc.
     """
 
-    def __init__(self, model_output_root, test_sets):
+    def __init__(self, model_output_root, test_sets, all_labelled_data):
         self.model_output_root = model_output_root
         self.test_sets = test_sets
+        self.all_labelled_data = all_labelled_data
         self.classified_candidates = None #(defined in classify_all_candidate_buildings)
-        Utils.__init__(self, test_sets)
+        self.reclassified = None #(defined in classify_with_rf_and_amcu)
+        Utils.__init__(self, all_labelled_data)
 
 
     def probabilities_to_classes(self, applied_model, threshold_val=0.85, nodata_val=-9999,\
@@ -148,9 +152,7 @@ class MapManips(Utils):
 
         for map_file in glob.glob(f'{model_dir}/*threshold*'):
 
-            for word in ['model_', 'votes_']:
-                if word in map_file:
-                    test_region = map_file.split(word)[-1].replace('.tif', '')
+            region = [reg for reg in self.all_labelled_data if reg in map_file][0]
 
             #open the map
             with rasterio.open(map_file, 'r') as f:
@@ -158,7 +160,7 @@ class MapManips(Utils):
                 meta = f.meta
 
             #open the corresponding NDVI map
-            ndvi_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_ndvi_hires.tif'
+            ndvi_file = f'{FEATURE_PATH}{self.all_labelled_data[region]}_ndvi_hires.tif'
             with rasterio.open(ndvi_file, 'r') as f:
                 ndvi_arr = f.read()
 
@@ -320,32 +322,32 @@ class MapManips(Utils):
         self.classified_candidates = gpd.GeoDataFrame()
 
         #get the list of map files
-        map_list = glob.glob(f'{model_dir}/*cleaner*.tif')
+        map_list = sorted(glob.glob(f'{model_dir}/*cleaner*.tif'))
 
-        #for each test_region map
+        #for each map
         for map_file in map_list:
 
-            #get the name of the test region
-            test_region = map_file.split('votes_')[-1].replace('.tif', '')
-            print(test_region)
+            #get the name of the region
+            region = [reg for reg in self.all_labelled_data.keys() if reg in map_file][0]
+            print(region)
 
             #read the map as a shapefile, containing 1 polygon per building candidate
             map_gdf = gpd.read_file(map_file.replace('.tif', '.shp'))
 
             #read the labelled response file for the test area, also as shapefile
             labels_gdf = gpd.read_file\
-                        (f'{RESPONSE_PATH}{self.test_sets[test_region]}_responses.shp')
+                        (f'{RESPONSE_PATH}{self.all_labelled_data[region]}_responses.shp')
 
             #open the aMCU file for the test region
-            amcu_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_amcu_hires.tif'
+            amcu_file = f'{FEATURE_PATH}{self.all_labelled_data[region]}_amcu_hires.tif'
             with rasterio.open(amcu_file, 'r') as f:
                 affine = f.transform
                 amcu_arr = f.read()
 
             #find building candidates that have been correctly and incorrectly identified
             correct, incorrect = self.label_building_candidates(labels_gdf, map_gdf)
-            correct['Values'] = 1
-            incorrect['Values'] = 0
+            correct['Region'] = region
+            incorrect['Region'] = region
 
             def poly_stats(building_df, amcu_arr, affine):
                 #find mean of aMCU raster within each building candidate in gdf (all bands)
@@ -356,46 +358,57 @@ class MapManips(Utils):
                 gdf = building_df.copy()
                 for band in range(7):
                     df_zonal_stats = pd.DataFrame(zonal_stats(building_df, amcu_arr[band],\
-                                                                  affine=affine))
+                                                              stats="mean", affine=affine,\
+                                                              nodata=np.nan))
                     gdf = pd.concat([gdf, df_zonal_stats['mean']], axis=1).reset_index(drop=True)
                     gdf.rename(columns={'mean': f'band{band} mean'}, inplace=True)
 
                 return gdf
 
-            #KonaMauka doesn't have any correctly-identified buildings
-            #(it only has 1 real one and that is missed)
-            if 'KonaMauka' not in test_region:
+            #KonaMauka and CCTrees probably don't have any (correctly-identified) buildings
+            if 'KonaMauka' not in region and 'CCTrees' not in region:
                 correct = poly_stats(correct, amcu_arr, affine)
                 self.classified_candidates = pd.concat([self.classified_candidates, correct])
 
             incorrect = poly_stats(incorrect, amcu_arr, affine)
             self.classified_candidates = pd.concat([self.classified_candidates, incorrect])
 
+        #mean=0.0 most likely indicates no data, don't want to use for training models
+        self.classified_candidates = self.classified_candidates\
+                                     [self.classified_candidates['band0 mean'] != 0.0]
         self.classified_candidates.reset_index(inplace=True, drop=True)
 
 
-    def classify_with_rf_and_amcu(self):
+    def classify_with_rf_and_amcu(self, show_confusion_matrix=True, show_feature_importance=True):
         """
-        h/t www.datacamp.com/tutorial/random-forests-classifier-python
+        Fit random forest models to the building candidates in self.classified candidates, which
+        are labelled 0 or 1 depending on whether they are false positives or genuine buildings.
+        Tune the n_estimators and max_depth hyperparameters, and use the best-performing model
+        to reclassify all the buildings according to whether the model thinks they are real or not.
+        Creates self.reclassified, a df that can be written back to shapefiles (cleaned maps) for
+        individual regions using self. create_reclassified_maps.
+        See www.datacamp.com/tutorial/random-forests-classifier-python
         """
 
         #get X (feature) and y (response/target) variables
-
-        X = self.classified_candidates.drop(columns=['geometry', 'Values'])
+        #X contains mean aMCU in each band for each building candidate
+        X = self.classified_candidates.drop(columns=['geometry', 'Values', 'Region'])
+        size = self.classified_candidates.geometry.area
+        X['size'] = size
         y = self.classified_candidates['Values']
 
         #split the data into training and test sets
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2)
 
-        #define some hyperparameters to tune
-        param_dist = {'n_estimators': randint(50,500),
-              'max_depth': randint(1,20)}
-
         #create a random forest classifier
-        randf = RandomForestClassifier()
-
         #use random search to find the best hyperparameters
-        rand_search = RandomizedSearchCV(randf, param_distributions = param_dist, n_iter=5, cv=5)
+        rand_search = RandomizedSearchCV(RandomForestClassifier(), param_distributions=\
+                                         {'n_estimators': randint(50, 500),\
+                                          'max_depth': randint(1, 20),\
+                                          'min_samples_split' : randint(2, 10),\
+                                          'min_samples_leaf' : randint(1, 5),\
+                                          'max_features': ('sqrt', None)}, n_iter=50, cv=5,\
+                                          n_jobs=-1)
 
         #fit the random search object to the data
         rand_search.fit(X_train, y_train)
@@ -404,6 +417,7 @@ class MapManips(Utils):
         best_rf = rand_search.best_estimator_
 
         #print the best hyperparameters
+        print('Best accuracy:',  rand_search.best_score_)
         print('Best hyperparameters:',  rand_search.best_params_)
 
         #predict classes for test data
@@ -413,13 +427,53 @@ class MapManips(Utils):
         print(classification_report(y_test, y_pred))
 
         #show the confusion matrix
-        cmat = confusion_matrix(y_test, y_pred)
-        ConfusionMatrixDisplay(confusion_matrix=cmat).plot()
+        if show_confusion_matrix:
+            _ = plt.figure()
+            cmat = confusion_matrix(y_test, y_pred)
+            ConfusionMatrixDisplay(confusion_matrix=cmat).plot()
 
         #show the feature importances
-        #feature_importances = pd.Series(best_rf.feature_importances_, index=X_train.columns).\
-        #                     sort_values(ascending=False)
-        #feature_importances.plot.bar();
+        if show_feature_importance:
+            _ = plt.figure()
+            feature_importances = pd.Series(best_rf.feature_importances_, index=X_train.columns).\
+                             sort_values(ascending=False)
+            feature_importances.plot.bar()
+
+        #get the model predictions for all X
+        self.reclassified = best_rf.predict(X)
+
+
+    def create_reclassified_maps(self, model_dir):
+        """
+        Write files containing maps in which building candidates are those identified
+        as genuine by the RF model (see self.classify_with_rf_and_amcu)
+        """
+
+        #create a df that only contains building candidates retained by the RF model
+        gdf = self.classified_candidates[['geometry', 'Region']].copy()
+        gdf['New Values'] = self.reclassified
+        gdf = gdf[gdf['New Values'] == 1]
+
+        #get the list of map files
+        map_list = glob.glob(f'{model_dir}/*cleaner*.shp')
+
+        #iterate over the train+test regions/tiles/mosaics, writing the new buildings to file
+        for map_file in map_list:
+
+            #get the name of the test region
+            region = map_file.split('votes_')[-1].replace('.shp', '')
+
+            #create an output filename
+            out_file = map_file.replace('cleaner', 'reclassified')
+
+            #get the buildings for this region (if there are any)
+            #undo buffering that was done in self.classify_all_candidate_buildings
+            temp = gdf[gdf['Region'] == region]
+            temp.geometry = temp.geometry.buffer(1)
+
+            #write to shapefile
+            if len(temp) > 0:
+                temp.to_file(out_file, driver='ESRI Shapefile')
 
 
 class Ensemble(MapManips):
@@ -427,17 +481,17 @@ class Ensemble(MapManips):
     Methods for creating ensemble maps
     """
 
-    def __init__(self, model_output_root, test_sets, ensemble_path):
+    def __init__(self, model_output_root, test_sets, ensemble_path, all_labelled_data):
         self.model_output_root = model_output_root
         self.test_sets = test_sets
         self.ensemble_path = ensemble_path
-        MapManips.__init__(self, model_output_root, test_sets)
+        MapManips.__init__(self, model_output_root, test_sets, all_labelled_data)
 
 
     def create_ensemble(self, model_nums, region, map_type='threshold', show=True):
         """
         Create an ensemble map for a region, starting from a threshold,
-        applied, ndvi_cut, or anmcu_cut map, by taking the sum of each map pixel.
+        applied, or ndvi_cut map, by taking the sum of each map pixel.
         This means that the value of each pixel in the output map indicates the number
         of input maps that classified that pixel as a building. Ensemble maps are
         saved as tifs.
@@ -515,10 +569,10 @@ class Evaluate(Utils):
     Methods for evaluating model performance and map quality and characteristics
     """
 
-    def __init__(self, model_output_root, test_sets):
+    def __init__(self, model_output_root, all_labelled_data):
         self.model_output_root = model_output_root
-        self.test_sets = test_sets
-        Utils.__init__(self, test_sets)
+        self.all_labelled_data = all_labelled_data
+        Utils.__init__(self, all_labelled_data)
 
 
     @classmethod
@@ -545,7 +599,7 @@ class Evaluate(Utils):
 
     def ndvi_hist(self, model_dir, ndvi_threshold):
         """
-        Produces a histogram of NDVI values for threshold maps of test
+        Produces a histogram of NDVI values for threshold maps of training+test
         regions, for a single model run. Shows values for all pixels (sample thereof),
         and for pixels correctly and incorrectly classified as buildings.
         """
@@ -559,15 +613,13 @@ class Evaluate(Utils):
         #for each test_region map
         for map_file in glob.glob(f'{model_dir}/*threshold*'):
 
-            for word in ['model_', 'votes_']:
-                if word in map_file:
-                    test_region = map_file.split(word)[-1].replace('.tif', '')
+            region = [reg for reg in self.all_labelled_data if reg in map_file][0]
 
             #open the map and response files
-            map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
+            map_arr, ref_arr = self._get_map_and_ref_data(map_file, region)
 
             #open the NDVI file so we can get NDVI values for the candidates
-            ndvi_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_ndvi_hires.tif'
+            ndvi_file = f'{FEATURE_PATH}{self.all_labelled_data[region]}_ndvi_hires.tif'
             with rasterio.open(ndvi_file, 'r') as f:
                 ndvi_arr = f.read()
             ndvi_arr = ndvi_arr[0]
@@ -593,82 +645,16 @@ class Evaluate(Utils):
                     [-0.5, 1.0], ndvi_threshold)
 
 
-    def amcu_scatter(self, model_dir, xband, yband, lims, incorrect):
-        """
-        Intended for producing scatters plot of two aMCU bands, normally 2 and 6.
-        """
-
-        fig, _ = plt.subplots(3, 3, figsize=(16, 8))
-
-        #get the list of map files, move KonaMauka to the front so it can be used as a reference
-        #the 3votes map for KonaMauka is hardwired, effort to fix that doesn't seem warranted
-        map_list = glob.glob(f'{model_dir}/*cleaner*.tif')
-        map_list.insert(0, map_list.pop(map_list.index\
-                                        (f'{model_dir}cleaner_3votes_KonaMauka.tif')))
-
-        #for each test_region map
-        for map_file, ax in zip(map_list, fig.axes):
-
-            #get the name of the test region
-            test_region = map_file.split('votes_')[-1].replace('.tif', '')
-
-            map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
-
-            #open the aMCU file
-            amcu_file = f'{FEATURE_PATH}{self.test_sets[test_region]}_amcu_hires.tif'
-            with rasterio.open(amcu_file, 'r') as f:
-                amcu_arr = f.read()
-
-            #get the aMCU bands that go on the x and y axes
-            xdata = amcu_arr[xband]
-            ydata = amcu_arr[yband]
-
-            #get x and y data where candidates were correctly identified, add to plot
-            correct_x = np.where(((ref_arr == 1) & (map_arr == 1)), xdata, -9999)
-            correct_y = np.where(((ref_arr == 1) & (map_arr == 1)), ydata, -9999)
-            ax.scatter(correct_x, correct_y, color='b', s=1, alpha=0.5, label='Correct')
-
-            #same for incorrect building candidate pixels, optionally
-            if incorrect == 'same':
-                incorrect_x = np.where(((ref_arr == 0) & (map_arr == 1)), xdata, -9999)
-                incorrect_y = np.where(((ref_arr == 0) & (map_arr == 1)), ydata, -9999)
-                ax.scatter(incorrect_x, incorrect_y, color='r', s=1, alpha=0.3, label='Incorrect')
-
-            #if we want to plot KonaMauka incorrect pix instead:
-            elif incorrect == 'KonaMauka':
-                if test_region == 'KonaMauka':
-                    kmx = np.where(((ref_arr == 0) & (map_arr == 1)), xdata, -9999)
-                    kmy = np.where(((ref_arr == 0) & (map_arr == 1)), ydata, -9999)
-                    rng = np.random.default_rng(seed=0)
-                    kmx = rng.choice(kmx, 10000, axis=0)
-                    kmy = rng.choice(kmy, 10000, axis=0)
-                    kmx = np.where((kmy > -9999), kmx, -9999)
-                    kmy = np.where((kmx > -9999), kmy, -9999)
-                    kmx = [k for k in kmx.flatten().tolist() if k > -9999]
-                    kmy = [k for k in kmy.flatten().tolist() if k > -9999]
-                ax.scatter(kmx, kmy, color='r', s=1, alpha=0.3, label='Incorrect')
-            else:
-                pass
-
-            ax.set_xlim(lims[0])
-            ax.set_ylim(lims[1])
-            ax.set_xlabel(f'aMCU band {xband}')
-            ax.set_ylabel(f'aMCU band {yband}')
-            ax.set_title(test_region)
-
-        plt.tight_layout()
-
-
 class Stats(Utils):
     """
     Methods for calculating and plotting performance statistics (map quality stats)
     """
 
-    def __init__(self, model_output_root, test_sets, analysis_path):
+    def __init__(self, model_output_root, test_sets, all_labelled_data, analysis_path):
         self.model_output_root = model_output_root
         self.test_sets = test_sets
         self.analysis_path = analysis_path
-        Utils.__init__(self, test_sets)
+        Utils.__init__(self, all_labelled_data)
 
 
     @classmethod
@@ -705,12 +691,14 @@ class Stats(Utils):
         #for each test_region map
         for map_file in map_list:
 
-            if 'KonaMauka' in map_file:
+            #is this a test region map? Or a training region map?
+            res = [region for region in self.test_sets.keys() if region in map_file]
+
+            #if this isn't a test region map, we'll exit and not calculate stats for it
+            if len(res) == 0:
                 continue
 
-            for word in ['model_', 'votes_']:
-                if word in map_file:
-                    test_region = map_file.split(word)[-1].replace('.tif', '')
+            test_region = res[0]
 
             #get the map and labelled response files for this test region
             map_arr, ref_arr = self._get_map_and_ref_data(map_file, test_region)
