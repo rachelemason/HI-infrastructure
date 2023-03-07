@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #performance.py
-#REM 2022-03-06
+#REM 2022-03-07
 
 
 """
@@ -110,7 +110,6 @@ class MapManips(Utils):
         self.test_sets = test_sets
         self.all_labelled_data = all_labelled_data
         self.classified_candidates = None #(defined in classify_all_candidate_buildings)
-        self.reclassified = None #(defined in classify_with_rf_and_amcu)
         Utils.__init__(self, all_labelled_data)
 
 
@@ -395,83 +394,8 @@ class MapManips(Utils):
         return X, y
 
 
-    def get_Xy_from_rasters(self):
-        """
-        Reads in all labelled building raster files, gets aMCU values for each pixel,
-        reformats as X, y variables for RF fitting with self.classify_with_rf_and_amcu.
-        """
-
-        y = []
-        X = [[] for x in range(7)]
-
-        #for each reference region
-        for region, data in self.all_labelled_data.items():
-            print(region)
-
-            #open the response files - this is where the labels are from
-            with rasterio.open(f'{RESPONSE_PATH}{data}_responses.tif') as f:
-                ref_arr = f.read()
-
-            #open the aMCU file for the test region, which will give our X variable
-            amcu_file = f'{FEATURE_PATH}{data}_amcu_hires.tif'
-            with rasterio.open(amcu_file, 'r') as f:
-                amcu_arr = f.read()
-
-            #reshape 2D to 1D so we can remove NaNs
-            ref_arr = np.ravel(ref_arr)
-            amcu_arr = np.reshape(amcu_arr, (amcu_arr.shape[0], -1))
-
-            #now remove the NaNs. Some considerations/complications:
-            # -- there aren't any Nans in ref_arr because these regions were selected to
-            #    not go off the edges of the LiDAR etc.
-            # -- NaN in the aMCU maps actually seems to be 0.0, not the usual -9999.0
-            # -- Also, different aMCU bands appear to have (slightly) different numbers of 0.0s,
-            #    with band1 seeming to have the most
-            #There must be a more efficient way of doing this, but...
-
-            for band, data in enumerate(amcu_arr):
-                X[band].extend([val for idx, val in enumerate(data) if amcu_arr[1][idx] != 0])
-            y.extend(ref_arr[amcu_arr[1] != 0])
-
-        #reformat as needed by sklearn for RF fitting
-        X = np.array(X).T
-        y = np.array(y)
-
-        np.save(f'{RESPONSE_PATH}X_for_fitting', X)
-        np.save(f'{RESPONSE_PATH}y_for_fitting', y)
-
-        return X, y
-
-
-    @classmethod
-    def sample_from_Xy(cls, X, y, sample=10000):
-        """
-        Divide large X and y arrays into arrays including only elements
-        where y=0 or y=1, then take a random sample from each of those. Doing it
-        that way means that buildings are better represented than they would be in
-        a simple random sample from all elements. Sampling is needed because the
-        original arrays are too large to fit modesl to.
-        """
-
-        def sample_zeros_or_ones(value):
-            temp_y = y[y==value] #labels where building=0
-            temp_x = X[y==value] #amcu values for pixels where building=0
-            idx = np.random.choice(np.arange(temp_y.shape[0]), sample, replace=False)
-            temp_y = temp_y[idx]
-            temp_x = temp_x[idx]
-
-            return temp_x, temp_y
-
-        zeros_x, zeros_y = sample_zeros_or_ones(value=0)
-        ones_x, ones_y = sample_zeros_or_ones(value=1)
-        y = np.concatenate((ones_y, zeros_y), axis=0)
-        X = np.concatenate((ones_x, zeros_x), axis=0)
-
-        return X, y
-
-
     def classify_with_rf_and_amcu(self, X, y, show_confusion_matrix=True,\
-                                  show_feature_importance=True):
+                                  show_feature_importance=True, n_iter=50):
         """
         Fit random forest models to the building candidates in self.classified candidates, which
         are labelled 0 or 1 depending on whether they are false positives or genuine buildings.
@@ -492,7 +416,7 @@ class MapManips(Utils):
                                           'max_depth': randint(1, 20),\
                                           'min_samples_split' : randint(2, 10),\
                                           'min_samples_leaf' : randint(1, 5),\
-                                          'max_features': ('sqrt', None)}, n_iter=50, cv=5,\
+                                          'max_features': ('sqrt', None)}, n_iter=n_iter, cv=5,\
                                           n_jobs=-1)
 
         #fit the random search object to the data
@@ -524,21 +448,23 @@ class MapManips(Utils):
                              sort_values(ascending=False)
             feature_importances.plot.bar()
 
-        #get the model predictions for all X
-        self.reclassified = best_rf.predict(X)
-
         return best_rf
 
 
-    def create_reclassified_shapefiles(self, model_dir):
+    def create_reclassified_maps(self, model_dir, best_rf, X):
         """
         Write files containing maps in which building candidates are those identified
         as genuine by the RF model (see self.classify_with_rf_and_amcu)
         """
 
         #create a df that only contains building candidates retained by the RF model
-        gdf = self.classified_candidates[['geometry', 'Region']].copy()
-        gdf['New Values'] = self.reclassified
+        #done this way to avoid settingwithcopywarnings
+        gdf = gpd.GeoDataFrame()
+        gdf.loc[:, 'geometry'] = self.classified_candidates[['geometry']]
+        gdf.loc[:, 'Region'] = self.classified_candidates[['Region']]
+
+        #get the model predictions for all X
+        gdf.loc[:, 'New Values'] = best_rf.predict(X)
         gdf = gdf[gdf['New Values'] == 1]
 
         #get the list of map files
@@ -555,43 +481,12 @@ class MapManips(Utils):
 
             #get the buildings for this region (if there are any)
             #undo buffering that was done in self.classify_all_candidate_buildings
-            temp = gdf[gdf['Region'] == region]
-            temp.geometry = temp.geometry.buffer(1)
+            temp = gdf[gdf['Region'] == region].copy()
+            temp.loc[:, 'geometry'] = temp.geometry.buffer(1)
 
             #write to shapefile
             if len(temp) > 0:
                 temp.to_file(out_file, driver='ESRI Shapefile')
-
-
-    def create_rf_classified_rasters(self, best_rf, outpath):
-        """
-        Use the best rf model to predict building classes based on aMCU and
-        save the result to a tif file in <outpath>.
-        """
-
-        #for each reference region
-        for region, data in self.all_labelled_data.items():
-            print(region)
-
-            #open the aMCU file for the test region
-            amcu_file = f'{FEATURE_PATH}{data}_amcu_hires.tif'
-            with rasterio.open(amcu_file, 'r') as f:
-                amcu_arr = f.read()
-                meta = f.meta
-
-            #reshape aMCU as necessary, get predicted classes, re-reshape
-            original_shape = amcu_arr[0].shape
-            amcu_arr = np.reshape(amcu_arr, (amcu_arr.shape[0], -1)).T
-            predicted = best_rf.predict(amcu_arr)
-            predicted = predicted.T.reshape(original_shape)
-            predicted = np.expand_dims(predicted, axis=0)
-
-            plt.imshow(predicted[0])
-            plt.show()
-
-            meta.update({'compress': 'lzw', 'count': 1})
-            with rasterio.open(f'{outpath}{region}_rf_predicted.tif', 'w', **meta) as f:
-                f.write(predicted)
 
 
 class Ensemble(MapManips):
@@ -890,4 +785,120 @@ class Stats(Utils):
 
         plt.tight_layout()
         plt.savefig(self.analysis_path+plot_file, dpi=400)
-            
+
+
+class MLClassify(MapManips):
+    """
+    Methods for classifying buildings based on applying random forest model
+    to aMCU data. This didn't work well so this code will probably be removed,
+    just moving it here now to keep things tidy just in case it's needed later.
+    """
+
+    def __init__(self, model_output_root, test_sets, all_labelled_data):
+        self.all_labelled_data = all_labelled_data
+        MapManips.__init__(self, model_output_root, test_sets, all_labelled_data)
+
+    def get_Xy_from_rasters(self):
+        """
+        Reads in all labelled building raster files, gets aMCU values for each pixel,
+        reformats as X, y variables for RF fitting with self.classify_with_rf_and_amcu.
+        """
+
+        y = []
+        X = [[] for x in range(7)]
+
+        #for each reference region
+        for region, data in self.all_labelled_data.items():
+            print(region)
+
+            #open the response files - this is where the labels are from
+            with rasterio.open(f'{RESPONSE_PATH}{data}_responses.tif') as f:
+                ref_arr = f.read()
+
+            #open the aMCU file for the test region, which will give our X variable
+            amcu_file = f'{FEATURE_PATH}{data}_amcu_hires.tif'
+            with rasterio.open(amcu_file, 'r') as f:
+                amcu_arr = f.read()
+
+            #reshape 2D to 1D so we can remove NaNs
+            ref_arr = np.ravel(ref_arr)
+            amcu_arr = np.reshape(amcu_arr, (amcu_arr.shape[0], -1))
+
+            #now remove the NaNs. Some considerations/complications:
+            # -- there aren't any Nans in ref_arr because these regions were selected to
+            #    not go off the edges of the LiDAR etc.
+            # -- NaN in the aMCU maps actually seems to be 0.0, not the usual -9999.0
+            # -- Also, different aMCU bands appear to have (slightly) different numbers of 0.0s,
+            #    with band1 seeming to have the most
+            #There must be a more efficient way of doing this, but...
+
+            for band, data in enumerate(amcu_arr):
+                X[band].extend([val for idx, val in enumerate(data) if amcu_arr[1][idx] != 0])
+            y.extend(ref_arr[amcu_arr[1] != 0])
+
+        #reformat as needed by sklearn for RF fitting
+        X = np.array(X).T
+        y = np.array(y)
+
+        np.save(f'{RESPONSE_PATH}X_for_fitting', X)
+        np.save(f'{RESPONSE_PATH}y_for_fitting', y)
+
+        return X, y
+
+
+    @classmethod
+    def sample_from_Xy(cls, X, y, sample=10000):
+        """
+        Divide large X and y arrays into arrays including only elements
+        where y=0 or y=1, then take a random sample from each of those. Doing it
+        that way means that buildings are better represented than they would be in
+        a simple random sample from all elements. Sampling is needed because the
+        original arrays are too large to fit modesl to.
+        """
+
+        def sample_zeros_or_ones(value):
+            temp_y = y[y==value] #labels where building=0
+            temp_x = X[y==value] #amcu values for pixels where building=0
+            idx = np.random.choice(np.arange(temp_y.shape[0]), sample, replace=False)
+            temp_y = temp_y[idx]
+            temp_x = temp_x[idx]
+
+            return temp_x, temp_y
+
+        zeros_x, zeros_y = sample_zeros_or_ones(value=0)
+        ones_x, ones_y = sample_zeros_or_ones(value=1)
+        y = np.concatenate((ones_y, zeros_y), axis=0)
+        X = np.concatenate((ones_x, zeros_x), axis=0)
+
+        return X, y
+
+
+    def create_rf_classified_rasters(self, best_rf, outpath):
+        """
+        Use the best rf model to predict building classes based on aMCU and
+        save the result to a tif file in <outpath>.
+        """
+
+        #for each reference region
+        for region, data in self.all_labelled_data.items():
+            print(region)
+
+            #open the aMCU file for the test region
+            amcu_file = f'{FEATURE_PATH}{data}_amcu_hires.tif'
+            with rasterio.open(amcu_file, 'r') as f:
+                amcu_arr = f.read()
+                meta = f.meta
+
+            #reshape aMCU as necessary, get predicted classes, re-reshape
+            original_shape = amcu_arr[0].shape
+            amcu_arr = np.reshape(amcu_arr, (amcu_arr.shape[0], -1)).T
+            predicted = best_rf.predict(amcu_arr)
+            predicted = predicted.T.reshape(original_shape)
+            predicted = np.expand_dims(predicted, axis=0)
+
+            plt.imshow(predicted[0])
+            plt.show()
+
+            meta.update({'compress': 'lzw', 'count': 1})
+            with rasterio.open(f'{outpath}{region}_rf_predicted.tif', 'w', **meta) as f:
+                f.write(predicted)
