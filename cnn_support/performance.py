@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #performance.py
-#REM 2022-03-07
+#REM 2022-03-09
 
 
 """
@@ -23,9 +23,12 @@ from osgeo import gdal
 import geopandas as gpd
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import RandomizedSearchCV, train_test_split
-from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
-from scipy.stats import randint
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay,\
+jaccard_score
+from scipy.stats import randint, hmean
+import seaborn as sns
 
+pd.set_option('display.precision', 2)
 
 FEATURE_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_features/'
 RESPONSE_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_buildings/'
@@ -71,8 +74,9 @@ class Utils():
     def label_building_candidates(cls, labels, result, tolerance=8):
         """
         Given a gdf of building candidates and a gdf of labels,
-        returns gdfs containing correctly-labelled buildings and of
-        false positives.
+        returns gdfs containing correctly-labelled buildings, labels that have matching
+        buildings, false negatives (labels w/o buildings) and false positives (buildings
+        w/o labels).
         """
 
         l_coords = [(p.x, p.y) for p in labels.centroid]
@@ -81,22 +85,79 @@ class Utils():
         matches = {}
         #find building candidates within some tolerance of labelled buildings (true positives)
         #each labelled building will end up with just one matched candidate (if any),
-        #even if there are multiple possibilities. This seems OK. THIS IS NOT OK
+        #even if there are multiple possibilities. This seems OK???
         for idx, coords in enumerate(l_coords):
             for idx2, coords2 in enumerate(r_coords):
                 if abs(coords[0] - coords2[0]) <= tolerance\
                 and abs(coords[1] - coords2[1]) <= tolerance:
-                    matches[idx] = idx2
-        matched_candidates = result.iloc[list(matches.values())].reset_index(drop=True)
-        matched_candidates['Values'] = 1
+                    matches[idx] = idx2 #key=labelled building, value=candidate building
+        matched_candx = result.iloc[list(matches.values())].reset_index(drop=True)
+        matched_candx['Values'] = 1
+        
+        matched_labels = labels.iloc[list(matches.keys())].reset_index(drop=True)
+        matched_labels['Values'] = 1
 
         #find all the building candidates that don't correspond to labelled buildings
         #false positives
         temp = [idx for idx, _ in enumerate(r_coords) if idx not in matches.values()]
-        unmatched_candidates = result.iloc[temp].reset_index(drop=True)
-        unmatched_candidates['Values'] = 0
+        unmatched_candx = result.iloc[temp].reset_index(drop=True)
+        unmatched_candx['Values'] = 0
+        
+        #find all the labeled buildings that were not detected
+        #false negatives
+        temp = [idx for idx, _ in enumerate(l_coords) if idx not in matches]
+        unmatched_labels = labels.iloc[temp].reset_index(drop=True)
+        unmatched_labels['Values'] = 0
 
-        return matched_candidates, unmatched_candidates
+        return matched_candx, unmatched_candx, matched_labels, unmatched_labels
+
+
+    @classmethod
+    def rasterize_and_save(cls, gdf, arr, meta, out_file, column):
+        """
+        Given a geodataframe and raference array/metadata, rasterize
+        the file using <column> values and save to <out_file>.
+        """
+
+        print(f'  - Rasterizing and saving {out_file}')
+        meta.update({'compress': 'lzw'})
+        with rasterio.open(out_file, 'w+', **meta) as f:
+            shapes = ((geom,value) for geom, value in zip(gdf['geometry'], gdf[column]))
+            burned = rasterize(shapes=shapes, fill=0, out_shape=f.shape, transform=f.transform)
+            burned[arr[0] < 0] = meta['nodata']
+            f.write_band(1, burned)
+
+
+    def remove_small_buildings(self, minsize=50):
+        """
+        Create new version of labelled response files with buildings with area
+        <= <minsize> removed. Then, rasterize those files. This doesn't belong
+        at all in this module/workflow, but I've resorted to putting it here for
+        reasons to do with environments and packages...
+        """
+
+        #directory initially containing copies of shapefiles in labeled_region_buildings dir
+        path = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/labeled_region_buildings2/*shp'
+        files = glob.glob(path)
+
+        for f in files:
+
+            gdf = gpd.read_file(f)
+            gdf = gdf.set_crs(epsg=32605)
+            gdf = gdf.loc[gdf.geometry.area > minsize]
+
+            if len(gdf) > 0:
+                gdf.loc[:, 'FID'] = 1
+                gdf.to_file(f, driver='ESRI Shapefile')
+
+                template = f.replace('shp', 'tif').replace('buildings2', 'buildings')
+                with rasterio.open(template, 'r') as src:
+                    arr = src.read()
+                    meta = src.meta
+                meta.update({'nodata': -9999.0}) #TODO: why is nodata not being propagated?
+                self.rasterize_and_save(gdf, arr, meta, f.replace('shp', 'tif'), column='FID')
+            else:
+                print(f'****Not handling {f}, copy it over yourself****')
 
 
 class MapManips(Utils):
@@ -299,13 +360,7 @@ class MapManips(Utils):
         gdf = self._remove_coastal_artefacts(gdf)
 
         #Rasterize and save what should be a 'cleaner' raster than the input one
-        print(f'  - Rasterizing and saving {out_file}')
-        meta.update({'compress': 'lzw'})
-        with rasterio.open(out_file, 'w+', **meta) as f:
-            shapes = ((geom,value) for geom, value in zip(gdf.geometry, gdf.Values))
-            burned = rasterize(shapes=shapes, fill=0, out_shape=f.shape, transform=f.transform)
-            burned[arr[0] < 0] = meta['nodata']
-            f.write_band(1, burned)
+        self.rasterize_and_save(gdf, arr, meta, out_file, 'Values')
 
         #Write the vector file as well
         gdf.to_file(out_file.replace('.tif', '.shp'), driver='ESRI Shapefile')
@@ -344,7 +399,7 @@ class MapManips(Utils):
                 amcu_arr = f.read()
 
             #find building candidates that have been correctly and incorrectly identified
-            correct, incorrect = self.label_building_candidates(labels_gdf, map_gdf)
+            correct, incorrect, _, _ = self.label_building_candidates(labels_gdf, map_gdf)
             correct['Region'] = region
             incorrect['Region'] = region
 
@@ -415,8 +470,7 @@ class MapManips(Utils):
                                          {'n_estimators': randint(50, 500),\
                                           'max_depth': randint(1, 20),\
                                           'min_samples_split' : randint(2, 10),\
-                                          'min_samples_leaf' : randint(1, 5),\
-                                          'max_features': ('sqrt', None)}, n_iter=n_iter, cv=5,\
+                                          'min_samples_leaf' : randint(1, 5)}, n_iter=n_iter, cv=5,\
                                           n_jobs=-1)
 
         #fit the random search object to the data
@@ -468,7 +522,7 @@ class MapManips(Utils):
         gdf = gdf[gdf['New Values'] == 1]
 
         #get the list of map files
-        map_list = glob.glob(f'{model_dir}/*cleaner*.shp')
+        map_list = glob.glob(f'{model_dir}*cleaner*.shp')
 
         #iterate over the train+test regions/tiles/mosaics, writing the new buildings to file
         for map_file in map_list:
@@ -487,6 +541,15 @@ class MapManips(Utils):
             #write to shapefile
             if len(temp) > 0:
                 temp.to_file(out_file, driver='ESRI Shapefile')
+                
+                #Rasterize and save (so we can compare 'before' and 'after' raster stats)
+                #This raster is just a template
+                with rasterio.open(map_file.replace('shp', 'tif'), 'r') as f:
+                    arr = f.read()
+                    meta = f.meta
+                meta.update({'nodata': -9999.0}) #TODO: why is nodata not being propagated?
+                self.rasterize_and_save(temp, arr, meta, out_file.replace('shp', 'tif'),\
+                                        'New Values')
 
 
 class Ensemble(MapManips):
@@ -667,6 +730,10 @@ class Stats(Utils):
         self.model_output_root = model_output_root
         self.test_sets = test_sets
         self.analysis_path = analysis_path
+        self.matched_candx = None #defined in self.vector_stats
+        self.matched_labels = None
+        self.unmatched_labels = None
+        self.unmatched_candx = None
         Utils.__init__(self, all_labelled_data)
 
 
@@ -703,7 +770,7 @@ class Stats(Utils):
 
         #for each test_region map
         for map_file in map_list:
-
+        
             #is this a test region map? Or a training region map?
             res = [region for region in self.test_sets.keys() if region in map_file]
 
@@ -741,13 +808,30 @@ class Stats(Utils):
 
             # get performance metrics
             stats_dict[test_region] = classification_report(expected, predicted, output_dict=True)
+            stats_dict[test_region].update({'jaccard': jaccard_score(expected, predicted)})
 
         return stats_dict
 
 
-    def stats_plot(self, stats_dict, plot_file):
+    @classmethod
+    def display_raster_stats(cls, stats_dict):
         """
-        Make a 9-panel plot in which each panel shows precision, recall, and f1-score
+        Display a data frame containing the stats obtained by self.raster_stats.
+        """
+        
+        df = pd.DataFrame()
+        for item in stats_dict:
+            df.loc[item, 'Precision'] = stats_dict[item]['1.0']['precision']
+            df.loc[item, 'Recall'] = stats_dict[item]['1.0']['recall']
+            df.loc[item, 'F1-score'] = stats_dict[item]['1.0']['f1-score']
+            df.loc[item, 'IoU'] = stats_dict[item]['jaccard']
+        df.loc['Mean'] = df.mean()
+        display(df)
+
+
+    def plot_raster_stats(self, stats_dict, plot_file):
+        """
+        Make a multi-panel plot in which each panel shows precision, recall, and f1-score
         for the test areas for a single model. At least as the models were orginally
         set up, rows=data type (DSM, eigenvalues, hillshade), columns=window size
         (16, 32, 64).
@@ -760,16 +844,19 @@ class Stats(Utils):
             recall = []
             f1score = []
             regions = []
+            iou = []
             for region, stats in sorted(stats_dict[model].items()):
                 if region != 'KonaMauka':
                     precision.append((stats['1.0']['precision']))
                     recall.append((stats['1.0']['recall']))
                     f1score.append((stats['1.0']['f1-score']))
+                    iou.append(stats['jaccard'])
                     regions.append(region)
             x = range(len(precision))
             ax.plot(x, precision, color='b', ms=6, marker='o', label='precision')
             ax.plot(x, recall, color='r', ms=6, marker='o', label='recall')
             ax.plot(x, f1score, color='k', ms=6, marker='o', label='f1-score')
+            ax.plot(x, iou, color='limegreen', ms=6, marker='o', label='IoU')
             ax.axhline(0.8, color='0.5', ls='--')
             ax.legend()
             ax.set_ylim(0, 1)
@@ -785,6 +872,116 @@ class Stats(Utils):
 
         plt.tight_layout()
         plt.savefig(self.analysis_path+plot_file, dpi=400)
+        
+        
+    def vector_stats(self, model_dir, map_kind='reclassified'):
+        """
+        Given a shapefile of building candidates and a labelled response file,
+        calculate precision, recall, f1-score, and IOU
+        """
+
+        stats_df = pd.DataFrame()
+        self.matched_candx = pd.DataFrame()
+        self.matched_labels = pd.DataFrame()
+        self.unmatched_labels = pd.DataFrame()
+        self.unmatched_candx = pd.DataFrame()
+
+        #get the list of map files
+        map_list = glob.glob(f'{model_dir}*{map_kind}*shp')
+
+        #for each test_region map
+        for map_file in map_list:
+
+            #is this a test region map? Or a training region map?
+            res = [region for region in self.test_sets.keys() if region in map_file]
+
+            #if this isn't a test region map, we'll exit and not calculate stats for it
+            if len(res) == 0:
+                continue
+
+            test_region = res[0]
+
+            labels = gpd.read_file(f"{RESPONSE_PATH}{self.test_sets[test_region]}_responses.shp")
+            result = gpd.read_file(f'{model_dir}{map_kind}_{test_region}.shp')
+            
+            matched_candx, unmatched_candx, matched_labels, unmatched_labels = \
+                                    self.label_building_candidates(labels=labels, result=result)
+            self.matched_labels = pd.concat([self.matched_labels, matched_labels])
+            self.matched_candx = pd.concat([self.matched_candx, matched_candx])
+            self.unmatched_labels = pd.concat([self.unmatched_labels, unmatched_labels])
+            self.unmatched_candx = pd.concat([self.unmatched_candx, unmatched_candx])
+
+            #Calculate precision, recall and f1-score for each test region
+            #precision = TP/(TP+FP)
+            #recall = TP/(TP+FN)
+            tempdict = {}
+            tempdict['precision'] = len(matched_candx)/(len(matched_candx)\
+                                                             +len(unmatched_candx))
+            tempdict['recall'] = len(matched_candx)/(len(matched_candx)\
+                                                          +len(unmatched_labels))
+            tempdict['f1-score'] = hmean([tempdict['precision'], tempdict['recall']])
+
+            #Calculate IoU for each test region
+            iou = []
+            for idx, row in matched_labels.iterrows():
+                poly1 = row['geometry']
+                poly2 = matched_candx.loc[idx, 'geometry']
+                intersect = poly1.intersection(poly2).area
+                union = poly1.union(poly2).area
+                iou.append(intersect / union)
+            tempdict['iou'] = np.mean(iou)
+            print('***PROBABLY NEED TO EDIT IOU CALC TO INCLUDE FALSE POSITIVES/NEGATIVES***')
+
+            for name, stat in zip(list(tempdict.keys()), list(tempdict.values())):
+                stats_df.loc[test_region, name] = stat
+
+            #Write out files for diagnostic purposes
+            for gdf, name in zip ([matched_labels, matched_candx, unmatched_labels,\
+                                   unmatched_candx], ['matched_labels', 'matched_candidates',\
+                                   'unmatched_labels', 'unmatched_candidates']):
+                if len(gdf) > 0:
+                    #Sometimes there are no unmatched X so no point saving
+                    gdf.to_file(f'{model_dir}{test_region}_{name}.shp', driver='ESRI Shapefile')
+                    
+        stats_df.loc['Mean'] = stats_df.mean()
+        display(stats_df)
+
+        
+    def building_size_plots(self):
+        """
+        Create a multi-part figure showing (1) detection rate vs building size, and
+        (2) mapped size vs manual size
+        """
+        
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
+        
+        print('NB: AX1 X axis limits exclude a small number of very large buildings (>1000 sq. m)')
+        data = pd.concat([self.matched_labels, self.unmatched_labels])
+        bins = np.arange(0, 1020, 10)
+        ax1.hist(data.geometry.area, bins=bins, label='All manually-labeled buildings')
+        ax1.hist(self.matched_labels.geometry.area, bins=bins, color='limegreen', histtype='step',\
+                 lw=2, label='Detected buildings')
+        ax1.hist(self.unmatched_labels.geometry.area, bins=bins, color='gold', histtype='step',\
+                 lw=2, label='Non-detections')
+        ax1.set_xlim(0, 1020)
+        ax1.set_ylim(0, 65)
+        ax1.legend()
+        ax1.set_xlabel('Manually-outlined building size, sq. m')
+        ax1.set_ylabel('Number of buildings')
+        
+        print('NB: AX2 Y axis limits may exclude outliers (if vectorise.bbox=True)')
+        data = pd.DataFrame()
+        data['Manual size'] = self.matched_labels.geometry.area
+        data['Model size'] = self.matched_candx.geometry.area
+        sns.scatterplot(data=data, x='Manual size', y='Model size', ax=ax2)
+        sns.kdeplot(data=data, x='Manual size', y='Model size', fill=True, cmap='viridis',\
+                    alpha=0.5, ax=ax2)
+        sns.regplot(data=data, x='Manual size', y='Model size', scatter=False, color='r')
+        ax2.set_xlim(0, 1000)
+        ax2.set_ylim(0, 1000)
+        ax2.set_xlabel('Manually-outlined building size, sq. m')
+        ax2.set_ylabel('Modeled building size, sq. m')
+        ax2.plot([0, 1000], [0, 1000], ls='--', color='k')
 
 
 class MLClassify(MapManips):
