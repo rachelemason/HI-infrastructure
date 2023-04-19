@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #performance.py
-#REM 2022-04-16
+#REM 2022-04-18
 
 
 """
@@ -10,7 +10,6 @@ run_models.py/RunModels.ipynb, and creating various diagnostic plots.
 
 import os
 import glob
-import random
 import pickle
 import matplotlib.pyplot as plt
 import numpy as np
@@ -18,22 +17,16 @@ import pandas as pd
 import rasterio
 from rasterio.features import rasterize
 from rasterio.enums import Resampling
-from rasterstats import zonal_stats
 import fiona
-from shapely.geometry import shape, MultiPolygon, Polygon, box
-from shapely.ops import nearest_points
+from shapely.geometry import shape, MultiPolygon, Polygon
 from osgeo import gdal
 import geopandas as gpd
 from xgboost import XGBClassifier
-from sklearn.preprocessing import StandardScaler
-from sklearn.decomposition import PCA as skl_PCA
-from sklearn.ensemble import RandomForestClassifier
 from sklearn.model_selection import RandomizedSearchCV, train_test_split, StratifiedKFold
-from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay,\
-jaccard_score, r2_score
+from sklearn.metrics import classification_report, jaccard_score
 import shap
-from scipy.stats import randint, hmean, pearsonr
-from scipy import ndimage, linalg
+from scipy.stats import hmean
+from scipy import linalg
 import seaborn as sns
 
 pd.set_option('display.precision', 2)
@@ -76,7 +69,7 @@ class Utils():
 
         map_arr = map_arr[0]
         ref_arr = ref_arr[0]
-        
+
         return map_arr, ref_arr
 
 
@@ -142,12 +135,12 @@ class Utils():
             if fill_nan:
                 burned[arr[0] < 0] = meta['nodata']
             f.write_band(1, burned)
-            
+
         if show:
             plt.imshow(burned)
             plt.show()
-            
-            
+
+
     @classmethod
     def resample_raster(cls, in_file, out_file, template_file):
         """
@@ -196,7 +189,7 @@ class Utils():
             gdf = gdf.loc[gdf.geometry.area > minsize]
 
             if len(gdf) > 0:
-                
+
                 gdf.loc[:, 'FID'] = 1
                 gdf.to_file(f, driver='ESRI Shapefile')
 
@@ -205,7 +198,7 @@ class Utils():
                 template = f.replace('shp', 'tif').replace(outpath, 'buildings/')
                 self.rasterize_and_save(gdf, template, f.replace('shp', 'tif'), column='FID',\
                                        fill_nan=False)
-                
+
                 #create a 2m-resolution response tif using the corresponding ndvi file
                 #as a template
                 template = f.replace(outpath, 'features/').replace('responses', 'ndvi')
@@ -258,46 +251,6 @@ class MapManips(Utils):
             f.write(output)
 
 
-    def data_cut(self, model_dir, map_type, cut_data_type, threshold, verbose=True):
-        """
-        Apply an NDVI cut to each map array in model_dir that contains binary classes,
-        write to file. Finds the NDVI value for each map pixel, and if it is > ndvi_threshold,
-        the class is changed from 1 to 0. Purpose is to to exclude trees that have been
-        incorrectly identified as buildings.
-        """
-
-        for map_file in glob.glob(f'{model_dir}/*{map_type}*'):
-
-            region = [reg for reg in self.all_labelled_data if reg in map_file][0]
-
-            #open the map
-            with rasterio.open(map_file, 'r') as f:
-                map_arr = f.read()
-                meta = f.meta
-
-            #open the corresponding NDVI map
-            data, band = list(cut_data_type.items())[0]
-            ndvi_file = f'{FEATURE_PATH}{self.all_labelled_data[region]}_{data}.tif'
-            with rasterio.open(ndvi_file, 'r') as f:
-                ndvi_arr = f.read()
-            ndvi_arr = ndvi_arr[band:band+1, :, :]
-
-            #set pixels with NDVI > threshold to 0 i.e. not-building; write to file
-            if 'ndvi' in data:
-                map_arr[ndvi_arr > threshold] = 0
-            elif 'irgb' in data:
-                map_arr[ndvi_arr < threshold] = 0
-            else:
-                raise ValueError(f'Not sure how to handle {data} data')
-            outfile = map_file.replace(map_type, f"{data.replace('_hires', '')}_cut")
-            if verbose:
-                print(f"Writing {outfile}")
-                plt.imshow(map_arr[0])
-                plt.show()
-            with rasterio.open(f"{outfile}", 'w', **meta) as f:
-                f.write(map_arr)
-
-
     def gb_prob_to_raster(self, best_model, bad_bands, xvars, out_prefix, model_dir,\
                                    bnorm, show=False):
         """
@@ -310,7 +263,7 @@ class MapManips(Utils):
             print(region)
 
             xdata = {}
-            
+
             for n, data_type in enumerate(xvars.keys()):
                 if 'refl' in data_type:
                     with rasterio.open(f'{FEATURE_PATH}{data}_{data_type}.tif', 'r') as f:
@@ -326,7 +279,7 @@ class MapManips(Utils):
                     with rasterio.open(f'{FEATURE_PATH}{data}_{data_type}.tif', 'r') as f:
                         xdata[n] = f.read()
                         meta = f.meta
-                        
+
                 if region == 'HBLower' and data_type != 'tch':
                     xdata[n] = xdata[n][:, :, :-1]
                 if region == 'HBLower' and data_type != 'cnn_model':
@@ -413,20 +366,6 @@ class MapManips(Utils):
 
         gdf = gdf.loc[gdf.within(coast.unary_union)].reset_index(drop=True)
 
-        #THIS REMOVES SOME BLDGS
-        #coastline as defined by County TMK map outline
-        #try:
-        #    parcels = gpd.read_file(f'{GEO_PATH}Parcels/Parcels_outline.shp')
-        #except fiona.errors.DriverError:
-        #    parcels = gpd.read_file(f'{GEO_PATH}Parcels/Parcels_-_Hawaii_County.shp')
-        #    parcels = parcels.to_crs(epsg=32605)
-        #    parcels['dissolve_by'] = 0
-        #    parcels = parcels.dissolve(by='dissolve_by').reset_index(drop=True)
-        #    parcels = parcels['geometry']
-        #    parcels.to_file(f'{GEO_PATH}Parcels/Parcels_outline.shp', driver='ESRI Shapefile')
-
-        #gdf = gdf.loc[gdf.within(parcels.unary_union)].reset_index(drop=True)
-
         return gdf
 
 
@@ -448,7 +387,7 @@ class MapManips(Utils):
         with rasterio.open(map_file) as f:
             arr = f.read()
             meta = f.meta
-            
+
         #set messed-up edges of regions to NaN, or we may get polygons covering the whole
         #array when we close holes
         arr[:, :4, :] = np.nan
@@ -478,7 +417,7 @@ class MapManips(Utils):
         gdf.geometry = gdf.geometry.buffer(buffers[1])
         #If polygons have been split into multipolygons, explode into separate rows
         gdf = gdf.explode(index_parts=True).reset_index(drop=True)
-        
+
         #Fill any interior holes
         gdf.geometry = gdf.geometry.apply(lambda row: self._close_holes(row))
 
@@ -494,26 +433,26 @@ class MapManips(Utils):
         #coastline
         print('  - Removing polygons outside/overlapping the coast')
         gdf = self._remove_coastal_artefacts(gdf)
-        
+
         #Save two versions of the final maps, each as both shapefiles and rasters
         #This first one has no bounding boxes applied; the polygons will be irregular
         #First, save (create a copy of) the geodataframe as it is
         gdf_bounds = gdf.copy()
         if len(gdf) > 0:
-                gdf.geometry = gdf.geometry.buffer(buffers[2])
-                self.rasterize_and_save(gdf, map_file, out_file, 'Values', show=False)
-                gdf.to_file(out_file.replace('.tif', '.shp'), driver='ESRI Shapefile')
+            gdf.geometry = gdf.geometry.buffer(buffers[2])
+            self.rasterize_and_save(gdf, map_file, out_file, 'Values', show=False)
+            gdf.to_file(out_file.replace('.tif', '.shp'), driver='ESRI Shapefile')
 
         #In this second one, the buildings are replaced by their minimum oriented bounding boxes
         def get_bbox(geom):
             poly = Polygon(geom)
             return poly.minimum_rotated_rectangle
-        
+
         def buffer_bbox(geom):
             area = geom['geometry'].area
             buffer_distance = area * -0.0035
             buffered_geom = geom['geometry'].buffer(buffer_distance)
-    
+
             if buffered_geom.is_empty:
                 return geom['geometry']
             else:
@@ -542,8 +481,8 @@ class Ensemble(MapManips):
         self.test_sets = test_sets
         self.ensemble_path = ensemble_path
         MapManips.__init__(self, model_output_root, all_labelled_data)
-        
-        
+
+
     def average_probabilities(self, model_nums, model_kind, region, show=True):
         """
         Create an ensemble map for a region by taking the average of the
@@ -575,7 +514,7 @@ class Ensemble(MapManips):
         if show:
             plt.imshow(combo[0][20:-20, 20:-20])
             plt.show()
-            
+
         #write the ensemble map to file
         os.makedirs(self.ensemble_path, exist_ok=True)
         meta.update({'count': 1})
@@ -587,82 +526,6 @@ class Ensemble(MapManips):
             with rasterio.open(f"{self.ensemble_path}gb_ensemble_prob_{region}.tif", 'w',\
                                **meta) as f:
                 f.write(combo)
-
-
-    def create_ensemble(self, model_nums, region, map_type='threshold', show=True):
-        """
-        Create an ensemble map for a region, starting from a threshold,
-        applied, or ndvi_cut map, by taking the sum of each map pixel.
-        This means that the value of each pixel in the output map indicates the number
-        of input maps that classified that pixel as a building. Ensemble maps are
-        saved as tifs.
-        """
-
-        allowed_types = ['threshold', 'applied', 'ndvi_cut', 'amcu_cut']
-        if map_type not in allowed_types:
-            raise ValueError(f"<map_type> must be one of {allowed_types}")
-
-        print(f'Working on {region}')
-        model_list = []
-
-        #get the relevant maps, for each test region
-        for num in model_nums:
-            this_file = f'{self.model_output_root}combo_{num}/{map_type}_model_{region}.tif'
-            with rasterio.open(this_file, 'r') as f:
-                this_array = f.read()
-                meta = f.meta
-            model_list.append(this_array)
-
-            #find the SUM of the maps, which can be interpreted as the number of 'votes'
-            #for a candidate building pixel
-            combo = np.sum(model_list, axis=0)
-
-        if show:
-            plt.imshow(combo[0][20:-20, 20:-20])
-            plt.show()
-
-        #write the ensemble map to file
-        os.makedirs(self.ensemble_path, exist_ok=True)
-        meta.update(count=1)
-        with rasterio.open(f"{self.ensemble_path}{map_type}_ensemble_{region}.tif", 'w',\
-                               **meta) as f:
-            f.write(combo)
-
-
-    def choose_cut_level(self, ensemble_file, n_votes, out_file, show=True):
-        """
-        For an ensemble created by self.create_ensemble() return a version converted to binary
-        classes using <n_votes>. The input ensemble will have pixel values = 0-n in steps of 1,
-        where n is the number of models that went into the ensemble. For example, an ensemble map
-        created from 5 individual models has pixel values like this:
-        0 - no models assigned class 'building' to this pixel
-        1 - 1 model assigned class 'building' to this pixel
-        2 - 2 models assigned class 'building' to this pixel
-        3 - 3 models assigned class 'building' to this pixel
-        4 - 4 models assigned class 'building' to this pixel
-        5 - 5 models assigned class 'building' to this pixel
-        Setting <n_votes>=4 will produce a model with binary building/not-building classes such
-        that each building will have received a positive classification from 4 input models.
-        This method must be used in order to produce a model that is understood by Performance.
-        performance_stats.
-        """
-
-        input_name = f"{self.ensemble_path}{ensemble_file}.tif"
-        output_name = f"{self.ensemble_path}{out_file}.tif"
-
-        with rasterio.open(input_name, 'r') as f:
-            arr = f.read()
-            meta = f.meta
-
-        arr[arr < n_votes] = 0
-        arr[arr >= n_votes] = 1
-
-        if show:
-            plt.imshow(arr[0])
-            plt.show()
-
-        with rasterio.open(output_name, 'w', **meta) as f:
-            f.write(arr)
 
 
 class Evaluate(Utils):
@@ -713,7 +576,7 @@ class Evaluate(Utils):
         #for each test_region map
         for map_file in glob.glob(f'{model_dir}/*{map_type}*'):
             region = [reg for reg in self.all_labelled_data if reg in map_file][0]
-            
+
             #quick hack to deal with my stupid filenames
             if 'Hamakua_A' in map_file and 'Hamakua' in region:
                 continue
@@ -740,7 +603,7 @@ class Evaluate(Utils):
 
         bldg_prob = [x for y in bldg_prob for x in y]
         notbldg_prob = [x for y in notbldg_prob for x in y]
-        
+
         if map_type == 'lores_model':
             #this should really be dealt with elsewhere but it's too late to refactor
             #everything now...
@@ -754,7 +617,7 @@ class Evaluate(Utils):
                     [0, 1], threshold, title, legend)
         plt.savefig(f'/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/for_figures/{map_type}_hist.png',\
                     dpi=450)
-        
+
 
     def get_vars_from_rasters(self, xvars, bad_bands, model_dir, run_id, mask_shade=True,\
                               bnorm=True):
@@ -770,9 +633,9 @@ class Evaluate(Utils):
         #for each reference region
         for region, data in self.training_sets.items():
             print(f'Getting data for {region}')
-            
+
             n = 0
-            
+
             #get the shade mask, if needed
             if mask_shade:
                 with rasterio.open(f'{FEATURE_PATH}{data}_pure_shade.tif') as f:
@@ -835,59 +698,20 @@ class Evaluate(Utils):
                         info = info[~np.isnan(info)]
                         X[band+n].extend(info)
                     n += arr.shape[0]
-                    
+
         #reformat as needed by sklearn for RF fitting
         print('Reformatting X...')
         X = np.array(X).T
         print('Reformatting y...')
         y = np.array(y)
         print(X.shape, y.shape)
-        
+
         print(f'Saving {run_id} X and y files')
         with open(f'{model_dir}X_{run_id}.pkl', "wb") as f:
             pickle.dump(X, f, protocol=4)
-            
+
         with open(f'{model_dir}y_{run_id}.pkl', "wb") as f:
             pickle.dump(y, f, protocol=4)
-
-        return X, y
-
-
-    @classmethod
-    def sample_from_vars(cls, X, y, sample=10000):
-        """
-        Divide large X and y arrays into arrays including only elements
-        where y=0 or y=1, then take a random sample from each of those. Doing it
-        that way means that buildings are better represented than
-        they would be in a simple random sample from all elements. Sampling is
-        needed because the original arrays are too large to fit models to.
-        """
-
-        def sample_zeros_or_ones(value):
-            temp_y = y[y==value]
-            temp_x = X[y==value]
-            print(f'There are {len(temp_x)} pixels with true class = {value}')
-            try:
-                idx = np.random.choice(np.arange(temp_y.shape[0]), int(sample/2), replace=False)
-                temp_y = temp_y[idx]
-                temp_x = temp_x[idx]
-            except ValueError:
-                print(f'{len(temp_x)} < {sample}; returning all pixels')
-
-            return temp_x, temp_y
-
-        #sample <sample>/2 X and y that are true positives
-        #real buildings: ref_array=1 and map_array=1 (latter comes out of get_Xy_from_rasters)
-        ones_x, ones_y = sample_zeros_or_ones(value=1)
-        print(f' -- Sampled {len(ones_x)} pixels')
-
-        #sample <sample>/2 X and y that are false positives
-        #ref_arry=0 even though map_array=1
-        zeros_x, zeros_y = sample_zeros_or_ones(value=0)
-        print(f' -- Sampled {len(zeros_x)} pixels')
-
-        y = np.concatenate((ones_y, zeros_y), axis=0)
-        X = np.concatenate((ones_x, zeros_x), axis=0)
 
         return X, y
 
@@ -903,7 +727,7 @@ class Evaluate(Utils):
         print('Creating training and test data')
         X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.5, stratify=y,\
                                                   random_state=RANDOM_STATE)
-        
+
         #save the training and test data for calculating metrics and making figures
         save_me = {'X_train': X_train, 'X_test': X_test, 'y_train': y_train, 'y_test': y_test}
         with open(save_to.replace('gb', 'train_test'), "wb") as f:
@@ -941,7 +765,7 @@ class Evaluate(Utils):
     def ml_metrics(cls, model, xvars, xy_file, save_to):
         """
         """
-        
+
         #print the best hyperparameters
         print('Best score:',  model.best_score_)
         print('Best hyperparameters:',  model.best_params_)
@@ -954,17 +778,13 @@ class Evaluate(Utils):
             ax.text(x, 0.81, txt, rotation=90, size=8)
         plt.ylim(0.8, 0.9)
         plt.show()
-        
+
         with open(xy_file, "rb") as f:
             xy = pickle.load(f)
         X_train = xy['X_train']
         X_test = xy['X_test']
         y_test = xy['y_test']
-        #split the (training) data into training and test sets
-        #print('Splitting data and making predictions')
-        #X_train, X_test, _, y_test = train_test_split(X, y, test_size=0.5, stratify=y,\
-        #                                        random_state=RANDOM_STATE)
-        
+
         #predict classes for test data
         y_pred = model.predict(X_test)
 
@@ -983,17 +803,17 @@ class Evaluate(Utils):
         display(feature_importances.head(10).to_frame().rename(columns={0: 'Importance'}).T)
         print('Least important features')
         display(feature_importances.tail(10).to_frame().rename(columns={0: 'Importance'}).T)
-        
+
         #Shapley values and plots
         print('Getting SHAP values')
         model = model.best_estimator_
         explainer = shap.TreeExplainer(model)
         shap_values = explainer.shap_values(X_train)
         shap_obj = explainer(X_train)
-        
+
         print('Creating bar plot')
         shap.plots.bar(shap_obj, max_display=12, show=True)
-        
+
         print('Creating summary plot')
         xnames = [x for y in xvars.values() for x in y]
         shap.summary_plot(shap_values,
@@ -1056,7 +876,7 @@ class Stats(Utils):
 
         #for each test_region map
         for map_file in map_list:
-            
+
             #quick hack to deal with my stupid filenames
             if 'Hamakua_A' in map_file and 'Hamakua' in regions.keys():
                 continue
@@ -1084,7 +904,7 @@ class Stats(Utils):
             if test_region == 'HBLower':
                 masko = masko[:, :-1]
                 ref_arr = ref_arr[:, :-1]
-            
+
             #trim outer 20 pix off each array
             #(map edges are NaN; npix to trim should really be related to window size)
             map_arr = map_arr[20:-20, 20:-20]
@@ -1176,7 +996,7 @@ class Stats(Utils):
     def match_buildings_to_labels(self, model_dir, map_kind):
         """
         """
-        
+
         self.matched_candx = pd.DataFrame()
         self.matched_labels = pd.DataFrame()
 
@@ -1190,26 +1010,15 @@ class Stats(Utils):
             if len(res) == 0:
                 continue
             test_region = res[0]
-            
+
             labels = gpd.read_file(f"{RESPONSE_PATH}{self.test_sets[test_region]}_responses.shp")
             result = gpd.read_file(f'{model_dir}{map_kind}_{test_region}.shp')
-            
+
             #Link labels to mapped buildings
             matched_candx, matched_labels, = \
                                     self.label_building_candidates(labels=labels, result=result)
             matched_candx['Region'] = test_region
             matched_labels['Region'] = test_region
-
-            #Calculate IoU for each test region
-            #iou = []
-            #for idx, row in matched_labels.iterrows():
-            #    poly1 = row['geometry']
-            #    poly2 = matched_candx.loc[idx, 'geometry']
-            #    intersect = poly1.intersection(poly2).area
-            #    union = poly1.union(poly2).area
-            #    iou.append(intersect / union)
-            #tempdict['iou'] = 'N/A'#np.mean(iou)
-            #print('***PROBABLY NEED TO EDIT IOU CALC TO INCLUDE FALSE POSITIVES/NEGATIVES***')
 
             #Write out files for diagnostic purposes
             for gdf, name in zip ([matched_labels, matched_candx],\
@@ -1221,7 +1030,6 @@ class Stats(Utils):
 
             self.matched_labels = pd.concat([self.matched_labels, matched_labels])
             self.matched_candx = pd.concat([self.matched_candx, matched_candx])
-            
 
 
     def vector_stats(self, model_dir, map_kind):
@@ -1249,7 +1057,7 @@ class Stats(Utils):
             #if this isn't a test region map, we'll exit and not calculate stats for it
             if len(res) == 0:
                 continue
-                
+
             if res[0] in ['KonaMauka', 'CCTrees']:
                 continue
 
@@ -1258,18 +1066,18 @@ class Stats(Utils):
             labels = gpd.read_file(f"{RESPONSE_PATH}{self.test_sets[test_region]}_responses.shp")
             result = gpd.read_file(f'{model_dir}{map_kind}_{test_region}.shp')
             boundary = gpd.read_file(f'{BOUNDARY_PATH}{self.test_sets[test_region]}_boundary.shp')
-            
+
             #use only results that are within region boundaries, or will have too many false
             #positives. Also, buffer region boundaries by 20 m, as for raster stats
             #TODO: raster stats were clipped by 20 pix at each side, is that 20 m or 40 m?
             boundary.geometry = boundary.geometry.buffer(-20)
             result = result[result.apply(lambda row: row.geometry.intersects(boundary.geometry[0]), axis=1)]
-            
+
             #Find labelled buildings that have a corresponding (overlapping) polygon in the map
             # --> true positives
             true_positives = []
-            for index1, row1 in labels.iterrows():
-                for index2, row2 in result.iterrows():
+            for _, row1 in labels.iterrows():
+                for _, row2 in result.iterrows():
                     if row1.geometry.intersects(row2.geometry):
                         true_positives.append(row1.geometry)
                         break
@@ -1289,7 +1097,7 @@ class Stats(Utils):
                     false_negatives.append(row1.geometry)
             self.false_negatives = self.false_negatives.append(gpd.GeoDataFrame(geometry=false_negatives),\
                                                              ignore_index=True)
-                    
+
             #and do the reverse to find false positives
             false_positives = []
             for index1, row1 in result.iterrows():
@@ -1299,7 +1107,6 @@ class Stats(Utils):
                         is_disjoint = False
                         break
                 if is_disjoint:
-                    print(row1.geometry.area)
                     false_positives.append(row1.geometry)
             self.false_positives = self.false_positives.append(gpd.GeoDataFrame(geometry=false_positives),\
                                                              ignore_index=True)
@@ -1318,20 +1125,20 @@ class Stats(Utils):
 
             for name, stat in zip(list(tempdict.keys()), list(tempdict.values())):
                 stats_df.loc[test_region, name] = stat
-                
+
         stats_df.sort_index(inplace=True)
         stats_df.loc['Mean'] = stats_df.mean()
         display(stats_df)
-        
+
 
     def distance_to_closest(self, gdf):
         """
         """
-            
+
         min_distances = []
-        for i, row in gdf.iterrows():
+        for _, row in gdf.iterrows():
             distances = []
-            for j, other_row in self.all_labelled_buildings.iterrows():
+            for _, other_row in self.all_labelled_buildings.iterrows():
                 distance = row['geometry'].distance(other_row['geometry'])
                 if distance > 0.001: #exclude same polygon in other df
                     distances.append(distance)
@@ -1346,7 +1153,7 @@ class Stats(Utils):
         Create a multi-part figure showing (1) detection rate vs building size, and
         (2) mapped size vs manual size
         """
-        
+
         plt.rcParams.update({'font.size': 14})
 
         _, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
@@ -1369,7 +1176,7 @@ class Stats(Utils):
         #TWINX: RECALL PLOT
         ax1.set_xlabel('Manually-outlined building size, sq. m')
         ax1.set_ylabel('Number of buildings')
-        
+
         ax1b = ax1.twinx()
         tp, _, _ = ax1b.hist(self.true_positives.geometry.area, bins=bins, alpha=0)
         fn, _, _ = ax1b.hist(self.false_negatives.geometry.area, bins=bins, alpha=0)
@@ -1382,7 +1189,7 @@ class Stats(Utils):
         recall = tp / (tp + fn)
         ax1b.plot(bins[:len(recall)]+step/2, recall, color='k', marker='o', mfc='w', ms='10',\
                   ls='-', label='Recall')
-        
+
         df = pd.DataFrame()
         df['Bin start'] = bins[:-1]
         df['Recall'] = recall
@@ -1429,10 +1236,8 @@ class Stats(Utils):
         #1:1 line
         ax2.plot([0, 1000], [0, 1000], ls='--', color='k')
 
-        #r, p_val = pearsonr(data['Manual size'], data['Model size'])
-        #ax2.text(0.85, 0.05, f'r = {r:.2f}', transform=ax2.transAxes)
         ax2.text(0.03, 0.96, '(b)', transform=ax2.transAxes)
-        
+
         ax2.set_xlim(0, 1000)
         ax2.set_ylim(0, 1000)
         ax2.set_xlabel('Manually-outlined building size, sq. m')
@@ -1440,144 +1245,3 @@ class Stats(Utils):
 
         plt.tight_layout()
         plt.savefig(f'{FIGURE_OUTPUT_PATH}buildings.png', dpi=450)
-
-
-class MLClassify(MapManips):
-    """
-    Methods for classifying building polygons - moved here for now because
-    classifying at the raster stage is probably better; will probably
-    remove.
-    """
-
-    def __init__(self, model_output_root, training_sets, all_labelled_data):
-        self.training_sets = training_sets
-        MapManips.__init__(self, model_output_root, None, all_labelled_data)
-
-
-    def classify_all_candidate_buildings(self, model_dir):
-        """
-        Create a gdf, self.classified candidates, containing polygons that are genuine
-        buildings (Value=1) and false positives (Value=0), respectively. Add columns
-        containing the mean aMCU (all bands) for each candidate.
-        """
-
-        self.classified_candidates = gpd.GeoDataFrame()
-
-        #get the list of map files
-        map_list = sorted(glob.glob(f'{model_dir}/*cleaner*.tif'))
-
-        #for each map
-        for map_file in map_list:
-
-            #get the name of the region
-            region = [reg for reg in self.all_labelled_data.keys() if reg in map_file][0]
-            print(region)
-
-            #read the map as a shapefile, containing 1 polygon per building candidate
-            map_gdf = gpd.read_file(map_file.replace('.tif', '.shp'))
-
-            #read the labelled response file for the test area, also as shapefile
-            labels_gdf = gpd.read_file\
-                        (f'{RESPONSE_PATH}{self.all_labelled_data[region]}_responses.shp')
-
-            #open the aMCU file for the test region
-            amcu_file = f'{FEATURE_PATH}{self.all_labelled_data[region]}_amcu_hires.tif'
-            with rasterio.open(amcu_file, 'r') as f:
-                affine = f.transform
-                amcu_arr = f.read()
-
-            #find building candidates that have been correctly and incorrectly identified
-            correct, incorrect, _, _ = self.label_building_candidates(labels_gdf, map_gdf)
-            correct['Region'] = region
-            incorrect['Region'] = region
-
-            def poly_stats(building_df, amcu_arr, affine):
-                #find mean of aMCU raster within each building candidate in gdf (all bands)
-
-                #buffer the polygon as edge pixels may not represent its 'real' aMCU values
-                building_df.geometry = building_df.geometry.buffer(-1)
-
-                gdf = building_df.copy()
-                for band in range(7):
-                    df_zonal_stats = pd.DataFrame(zonal_stats(building_df, amcu_arr[band],\
-                                                              stats="mean", affine=affine,\
-                                                              nodata=np.nan))
-                    gdf = pd.concat([gdf, df_zonal_stats['mean']], axis=1).reset_index(drop=True)
-                    gdf.rename(columns={'mean': f'band{band} mean'}, inplace=True)
-
-                return gdf
-
-            #KonaMauka and CCTrees probably don't have any (correctly-identified) buildings
-            if 'KonaMauka' not in region and 'CCTrees' not in region:
-                correct = poly_stats(correct, amcu_arr, affine)
-                self.classified_candidates = pd.concat([self.classified_candidates, correct])
-
-            incorrect = poly_stats(incorrect, amcu_arr, affine)
-            self.classified_candidates = pd.concat([self.classified_candidates, incorrect])
-
-        #mean=0.0 most likely indicates no data, don't want to use for training models
-        self.classified_candidates = self.classified_candidates\
-                                     [self.classified_candidates['band0 mean'] != 0.0]
-        self.classified_candidates.reset_index(inplace=True, drop=True)
-
-
-    def get_vars_from_df(self):
-        """
-        Extract feature and response variables from self.classified candidates. See
-        self.classify_all_candidate_buildings and self.classify_with_rf_and_amcu.
-        """
-
-        #get X (feature) and y (response/target) variables
-        #X contains mean aMCU in each band for each building candidate
-        X = self.classified_candidates.drop(columns=['geometry', 'Values', 'Region'])
-        size = self.classified_candidates.geometry.area
-        X['size'] = size
-        y = self.classified_candidates['Values']
-
-        return X, y
-
-    def create_reclassified_maps(self, model_dir, best_rf, X):
-        """
-        Write files containing maps in which building candidates are those identified
-        as genuine by the RF model (see self.classify_with_rf_and_amcu)
-        """
-
-        #create a df that only contains building candidates retained by the RF model
-        #done this way to avoid settingwithcopywarnings
-        gdf = gpd.GeoDataFrame()
-        gdf.loc[:, 'geometry'] = self.classified_candidates[['geometry']]
-        gdf.loc[:, 'Region'] = self.classified_candidates[['Region']]
-
-        #get the model predictions for all X
-        gdf.loc[:, 'New Values'] = best_rf.predict(X)
-        gdf = gdf[gdf['New Values'] == 1]
-
-        #get the list of map files
-        map_list = glob.glob(f'{model_dir}*cleaner*.shp')
-
-        #iterate over the train+test regions/tiles/mosaics, writing the new buildings to file
-        for map_file in map_list:
-
-            #get the name of the test region
-            region = map_file.split('votes_')[-1].replace('.shp', '')
-
-            #create an output filename
-            out_file = map_file.replace('cleaner', 'reclassified')
-
-            #get the buildings for this region (if there are any)
-            #undo buffering that was done in self.classify_all_candidate_buildings
-            temp = gdf[gdf['Region'] == region].copy()
-            temp.loc[:, 'geometry'] = temp.geometry.buffer(1)
-
-            #write to shapefile
-            if len(temp) > 0:
-                temp.to_file(out_file, driver='ESRI Shapefile')
-
-                #Rasterize and save (so we can compare 'before' and 'after' raster stats)
-                #This raster is just a template
-                with rasterio.open(map_file.replace('shp', 'tif'), 'r') as f:
-                    arr = f.read()
-                    meta = f.meta
-                meta.update({'nodata': -9999.0}) #TODO: why is nodata not being propagated?
-                self.rasterize_and_save(temp, arr, meta, out_file.replace('shp', 'tif'),\
-                                        'New Values')
