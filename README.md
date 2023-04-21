@@ -1,6 +1,6 @@
 # HI-infrastructure
 
-This repository contains the python modules and iPython notebooks used to produce the results and figures in Mason, Vaughn & Asner (2023). As Global Airborne Observatory data proprietary, users will not be able to fully reproduce this work and the code has not been written with this in mind. Nonetheless, the workflow, comments, and environment files may be useful for those who are applying similar methods to their own data.
+This repository contains the python modules and iPython notebooks used to produce the results and figures in Mason, Vaughn & Asner (2023). As Global Airborne Observatory data are proprietary, users will not be able to fully reproduce this work and the code has not been written with this in mind. Nonetheless, the workflow, comments, and environment files may be useful for those who are applying similar methods to their own data.
 
 Each notebook calls an associated python module that contains the bulk of the code needed to do the work:
 
