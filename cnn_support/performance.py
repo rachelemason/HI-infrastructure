@@ -116,7 +116,8 @@ class Utils():
 
 
     @classmethod
-    def rasterize_and_save(cls, gdf, template, out_file, column, fill_nan=True, show=False):
+    def rasterize_and_save(cls, gdf, template, out_file, column, fill_nan=True,\
+                           fill_nan_2=False, nan2_arr=None, show=False):
         """
         Given a geodataframe and raference array/metadata, rasterize
         the file using <column> values and save to <out_file>.
@@ -134,6 +135,8 @@ class Utils():
             burned = rasterize(shapes=shapes, fill=0, out_shape=f.shape, transform=f.transform)
             if fill_nan:
                 burned[arr[0] < 0] = meta['nodata']
+            if fill_nan_2:
+                burned = np.where(np.isnan(nan2_arr[0]), np.nan, burned)
             f.write_band(1, burned)
 
         if show:
@@ -148,7 +151,7 @@ class Utils():
         """
 
         with rasterio.open(in_file) as src:
-            print(f'Working on {in_file}')
+            print(f'Resampling {in_file}')
 
             with rasterio.open(template_file) as template:
                 new_height = template.height
@@ -211,8 +214,7 @@ class Utils():
 
 class MapManips(Utils):
     """
-    Methods for manipulating applied model 'maps' - converting probabilities
-    to classes, applying NDVI cut, etc.
+    Methods for manipulating applied model 'maps'
     """
 
     def __init__(self, model_output_root, all_labelled_data):
@@ -254,7 +256,7 @@ class MapManips(Utils):
     def gb_prob_to_raster(self, best_model, bad_bands, xvars, out_prefix, model_dir,\
                                    bnorm, show=False):
         """
-        Use an rf model to predict building classes based on xvars and
+        Use an XGB model to predict building classes based on xvars and
         save the result to a tif file
         """
 
@@ -334,7 +336,8 @@ class MapManips(Utils):
             return remove_interiors(geom)
 
 
-    def _remove_roads(self, gdf):
+    @classmethod
+    def _remove_roads(cls, gdf):
         """
         Helper method for self.vectorise_and_clean(). Reads roads from
         ROAD_FILES, applies buffer, removes polygons
@@ -369,7 +372,7 @@ class MapManips(Utils):
         return gdf
 
 
-    def vectorize_and_clean(self, map_file, out_file, buffers, minpix=25):
+    def vectorize_and_clean(self, map_file, out_file, buffers, minpix=25, mask_edges=True):
         """
         Vectorize a raster map. Then:
         - Remove polygons with area less than <minpix> sq. m
@@ -389,11 +392,13 @@ class MapManips(Utils):
             meta = f.meta
 
         #set messed-up edges of regions to NaN, or we may get polygons covering the whole
-        #array when we close holes
-        arr[:, :4, :] = np.nan
-        arr[:, -4:, :] = np.nan
-        arr[:, :, :4] = np.nan
-        arr[:, :, -4:] = np.nan
+        #array when we close holes (don't do this with mosaics)
+        if mask_edges:
+            print('Setting dodgy edge pixels to NaN')
+            arr[:, :4, :] = np.nan
+            arr[:, -4:, :] = np.nan
+            arr[:, :, :4] = np.nan
+            arr[:, :, -4:] = np.nan
 
         print(f'Vectorizing {map_file}')
         polygons = []
@@ -440,7 +445,8 @@ class MapManips(Utils):
         gdf_bounds = gdf.copy()
         if len(gdf) > 0:
             gdf.geometry = gdf.geometry.buffer(buffers[2])
-            self.rasterize_and_save(gdf, map_file, out_file, 'Values', show=False)
+            self.rasterize_and_save(gdf, map_file, out_file, 'Values', fill_nan_2=True,\
+                                    nan2_arr=arr, show=False)
             gdf.to_file(out_file.replace('.tif', '.shp'), driver='ESRI Shapefile')
 
         #In this second one, the buildings are replaced by their minimum oriented bounding boxes
@@ -466,8 +472,8 @@ class MapManips(Utils):
         #Write the bounding box files
         if len(gdf_bounds) > 0:
             out_file = out_file.replace('poly', 'bounds')
-            print(out_file)
-            self.rasterize_and_save(gdf_bounds, map_file, out_file, 'Values', show=False)
+            self.rasterize_and_save(gdf_bounds, map_file, out_file, 'Values', fill_nan_2=True,\
+                                    nan2_arr=arr, show=False)
             gdf_bounds.to_file(out_file.replace('.tif', '.shp'), driver='ESRI Shapefile')
 
 
@@ -648,7 +654,6 @@ class Evaluate(Utils):
             for data_type in data_types:
 
                 if data_type == 'refl':
-                    #TODO: make it so that IRGB data can be handled and used for NaN mask
                     with rasterio.open(f'{FEATURE_PATH}{data}_{data_type}.tif', 'r') as f:
                         arr = f.read()
                         arr = arr[:, 20:-20, 20:-20]
