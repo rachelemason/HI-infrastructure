@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 #figure_code.py
-#REM 2022-04-16
+#REM 2022-04-20
 
 """
-Functions for making figures in the HI building mapping paper
+Functions for making figures in Mason, Vaughn & Asner (2023)
 """
 
 import os
@@ -22,16 +22,107 @@ import matplotlib.lines as lines
 import seaborn as sns
 from skimage import exposure
 import rasterio
+from rasterio.merge import merge
+from rasterio.mask import mask
 import fiona
+from shapely.geometry import shape
 import pandas as pd
 import geopandas as gpd
 import sampleraster
 
 
 BASE_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/'
+SHAPEFILE_PATH = '/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/study_region_boundaries/'
 FIGURE_DATA_PATH = f'{BASE_PATH}/for_figures/'
 FIGURE_OUTPUT_PATH = '/home/remason2/figures/'
 BAD_BANDS = [list(range(0,5)), list(range(94, 117)), list(range(142, 179)), [211, 212, 213]]
+
+def count_buildings(feature_path, response_path, available_training_sets):
+        """
+        Count and print the number of polygons (which are generally buildings)
+        in each shapefile in training or test datasets, and the number of
+        polygons/buildings in the entire training set. Same with areas covered.
+        """
+
+        building_count = 0
+        pixel_count = 0
+        areas = 0
+        for nickname, shpfile in available_training_sets.items():
+            if 'HBMain' not in shpfile: #avoid double-counting overlap with HBLower, if HBMain used
+                gdf = gpd.read_file(response_path+shpfile+'_responses.shp')
+
+                with rasterio.open(feature_path+shpfile+'_hires_surface.tif') as src:
+                    pixels = src.shape[0] * src.shape[1]
+
+                print(f"{nickname} contains {pixels*1e-6:.1f} sq km, and {len(gdf)} features")
+                
+                pixel_count += pixels * 1e-6
+                building_count += len(gdf)
+                
+        print(f'Total number of features = {building_count}')
+        print(f'Total area = {pixel_count:.0f} sq km')
+        
+
+def create_mapped_region_outline(region, tiles, boundary_file):
+    """
+    This creates a shapefile showing the outlines of the mapped regions.
+    It is used in QGIS to create Figure 2.
+    """
+    
+    print('Getting IRGB files and setting all non-NaN pixels to 0')
+    path = '/data/gdcsdata/HawaiiMapping/Full_Backfilled_Tiles/'
+    for tile in tiles:
+        with rasterio.open(f'{path}tile{tile}/tile{tile}_mosaic_irgb.tif') as src:
+            arr = src.read(1)
+            meta = src.meta
+        arr = np.where(arr != meta['nodata'], 0, arr)
+        arr = np.expand_dims(arr, 0)
+        
+        meta.update({'count': 1})
+        with rasterio.open(f'tmp_{tile}.tif', 'w', **meta) as dst:
+            dst.write(arr)
+            
+    print('Making mosaic')
+    to_mosaic = []
+    for tile in tiles:
+        raster = rasterio.open(f'tmp_{tile}.tif', 'r')
+        to_mosaic.append(raster)
+        meta = raster.meta
+
+    mosaic, out_trans = merge(to_mosaic)
+    meta.update({'transform': out_trans, 'height': mosaic.shape[1], 'width': mosaic.shape[2]})
+    with rasterio.open(f'tmp_mosaic.tif', 'w', **meta) as f:
+        f.write(mosaic)
+        
+    print('Cropping to study region boundaries')
+    with fiona.open(f'{SHAPEFILE_PATH}{boundary_file}', "r") as shpf:
+        shapes = [feature["geometry"] for feature in shpf]
+
+    with rasterio.open(f'tmp_mosaic.tif') as f:
+        cropped, out_trans = mask(f, shapes, crop=True)
+        meta = f.meta
+
+    meta.update({'transform': out_trans, 'height': cropped.shape[1], 'width': cropped.shape[2]})
+    
+    print('Vectorising')
+    polygons = []
+    values = []
+    for vec in rasterio.features.shapes(cropped.astype(np.int32), transform=meta['transform']):
+        polygons.append(shape(vec[0]))
+        values.append(vec[1])
+        gdf = gpd.GeoDataFrame(crs=meta['crs'], geometry=polygons)
+    gdf['Value'] = values
+    gdf = gdf[gdf['Value'] == 0]
+    
+    areas = gdf.geometry.area
+    total_area = areas.sum()
+    print(f'Total area of {region} mapped area is {total_area * 1e-6:.0f} sq km')
+
+    gdf.to_file(f'{FIGURE_DATA_PATH}{region}_polygon.shp', driver='ESRI Shapefile')
+
+    for tile in tiles:
+        os.remove(f'tmp_{tile}.tif')
+    os.remove(f'tmp_mosaic.tif')
 
 
 def _make_rgb(img, bands, percentile=2):
@@ -67,7 +158,7 @@ def _hillshade(img):
 
 def model_progress():
     """
-    This creates Figue X, which shows the progression of model steps from several 150x150m
+    This creates Figure 2, which shows the progression of model steps from several 150x150m
     regions
     """
     
@@ -98,9 +189,13 @@ def model_progress():
                 img = _make_rgb(img, [1, 2, 3])
                 ax.imshow(img)
 
-            elif data_type in ['model', 'prob']:
+            if data_type == 'model':
                 img = img[0]
                 ax.imshow(img, vmin=0, vmax=1, cmap='Greys_r')
+                
+            if data_type == 'prob':
+                img = img[0]
+                ax.imshow(img, vmin=0, vmax=1, cmap='Greys')
 
             elif data_type == 'poly' and region not in ['KonaMauka', 'CCTrees']:
                 
@@ -128,17 +223,34 @@ def model_progress():
 
             ax.axis('off')
             
-    #insert numbers indicating the objects whose spectra were extracted
-    axes[0, 2].text(0.11, 0.1, '1', color='magenta', weight='bold', fontsize=16,\
+    #add panel labels
+    labels = {(0, 0): '(a)', (0, 1): '(b)', (0, 2): '(c)', (0, 3): '(d)', (0, 4): '(e)'}
+    for ax, label in labels.items():
+        axis = axes[ax[0], ax[1]]
+        axis.text(0.05, 0.95, label, ha='left', va='top', size=14, color='0.5',\
+                  transform=axis.transAxes)
+            
+    #add numbers and arrows indicating the objects whose spectra were extracted
+    axes[0, 2].text(0.11, 0.3, '1', color='magenta', weight='bold', fontsize=16,\
                     transform=axes[0, 2].transAxes)
-    axes[0, 2].text(0.76, 0.155, '2', color='magenta', weight='bold', fontsize=16,\
+    axes[0, 2].arrow(0.145, 0.27, 0, -0.09, color='magenta', width=0.005,\
+                     transform=axes[0, 2].transAxes)
+    axes[0, 2].text(0.76, 0.355, '2', color='magenta', weight='bold', fontsize=16,\
                     transform=axes[0, 2].transAxes)
-    axes[0, 2].text(0.5, 0.63, '3', color='magenta', weight='bold', fontsize=16,\
+    axes[0, 2].arrow(0.795, 0.325, 0, -0.09, color='magenta', width=0.005,\
+                     transform=axes[0, 2].transAxes)
+    axes[0, 2].text(0.5, 0.78, '3', color='magenta', weight='bold', fontsize=16,\
                     transform=axes[0, 2].transAxes)
-    axes[1, 2].text(0.46, 0.06, '4', color='magenta', weight='bold', fontsize=16,\
+    axes[0, 2].arrow(0.535, 0.755, 0, -0.09, color='magenta', width=0.005,\
+                     transform=axes[0, 2].transAxes)
+    axes[1, 2].text(0.65, 0.04, '4', color='magenta', weight='bold', fontsize=16,\
                     transform=axes[1, 2].transAxes)
-    axes[4, 2].text(0.28, 0.85, '5', color='magenta', weight='bold', fontsize=16,\
+    axes[1, 2].arrow(0.63, 0.08, -0.09, 0, color='magenta', width=0.005,\
+                     transform=axes[1, 2].transAxes)
+    axes[4, 2].text(0.29, 0.63, '5', color='magenta', weight='bold', fontsize=16,\
                     transform=axes[4, 2].transAxes)
+    axes[4, 2].arrow(0.32, 0.73, 0, 0.09, color='magenta', width=0.005,\
+                     transform=axes[4, 2].transAxes)
 
     #this draws lines separating subplots. Doing it this way because the vector plots
     #have weird boundaries instead of nice squares
@@ -382,6 +494,7 @@ def _sort_out_stupid_input(dictos):
 
 def shapley_plot(bnorm_spectra, nonorm_spectra, ptrue=0.01):
     """
+    This makes figure 4.
     """
     
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
@@ -424,6 +537,8 @@ def shapley_plot(bnorm_spectra, nonorm_spectra, ptrue=0.01):
 
     plotme = _sort_out_stupid_input(nonorm_spectra)
     for id_num, spectrum in plotme.items():
+        #convert spectra from %*100 to %...
+        spectrum = [x * 0.01 for x in spectrum]
         ax2.plot(wavelengths, spectrum, color=colors[id_num[0]], zorder=3,\
                  label=labels[id_num[0]])
         for idx, wav in enumerate(wavelengths):
@@ -435,7 +550,7 @@ def shapley_plot(bnorm_spectra, nonorm_spectra, ptrue=0.01):
     ax2.xaxis.set_label_position('top')
     ax2.set_xlim(370, 2480)
     ax2.set_xlabel('Wavelength, nm')
-    ax2.set_ylabel('Reflectance - UNITS?')
+    ax2.set_ylabel('Reflectance, %')
 
     plt.subplots_adjust(hspace=0, left=0.1, right=0.9, bottom=0.1, top=0.9)
     plt.savefig(f'{FIGURE_OUTPUT_PATH}shap.png', dpi=450)
@@ -443,7 +558,8 @@ def shapley_plot(bnorm_spectra, nonorm_spectra, ptrue=0.01):
     
 def histos():
     """
-    Get png histograms produced by Performance.ipynb and put them into a single figure
+    Get png histograms produced by Performance.ipynb and put them into a single figure,
+    for figure 5
     """
     
     hist1 = img.imread(f'{FIGURE_DATA_PATH}lores_model_hist.png')
@@ -460,21 +576,3 @@ def histos():
         
     plt.subplots_adjust(wspace=0, right=0.9)
     plt.savefig(f'{FIGURE_OUTPUT_PATH}histograms.png', dpi=450)
-    
-    
-def median_building_size():
-    """
-    Use real estate listing stats to estimate the median building size in Hawai'i County
-    Data from here: https://www.realtor.com/research/data/
-    """
-    
-    df = pd.read_csv(f'{FIGURE_DATA_PATH}RDC_Inventory_Core_Metrics_County_History.csv',\
-                     usecols=['county_name', 'median_square_feet', 'month_date_yyyymm'],\
-                     low_memory=False).dropna()
-    df = df[df['county_name'].str.contains('hawaii', case=False)]
-    
-    mean_sq_ft = df['median_square_feet'].median()
-    mean_sq_m = mean_sq_ft * 0.0929
-    
-    print(f'The median median square footage of houses listed for sale in HI county between 2016-2023 is {mean_sq_ft:.0f} sq ft ({mean_sq_m:.0f} sq m)')
-    

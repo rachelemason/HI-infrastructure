@@ -44,31 +44,6 @@ class TrainingData():
     def __init__(self):
         pass
 
-
-    @classmethod
-    def count_buildings(cls, feature_path, response_path, available_training_sets):
-        """
-        Count and print the number of polygons (which are generally buildings)
-        in each shapefile in available_training_data. Also print the number of
-        polygons/buildings in the entire training set.
-        """
-
-        building_count = 0
-        pixel_count = 0
-        for nickname, shpfile in available_training_sets.items():
-            if 'HBMain' not in shpfile: #avoid double-counting overlap with HBLower
-                geom = fiona.open(response_path+shpfile+'_responses.shp')
-
-                with rasterio.open(feature_path+shpfile+'_hires_surface.tif') as src:
-                    pixels = src.shape[0] * src.shape[1]
-
-                print(f"{nickname} contains {pixels} pixels and {len(geom)} features")
-                building_count += len(geom)
-                pixel_count += pixels
-        print(f'Total number of features = {building_count}')
-        print(f'Total number of pixels = {pixel_count}')
-
-
     @classmethod
     def create_training_lists(cls, paths, all_training_sets, desired_training_set):
         """
@@ -237,6 +212,6 @@ class Loops():
         experiment = experiments.Experiment(config)
         experiment.build_or_load_model(data_container=data_container)
 
-        print(f'Working on {application_file}, writing {outfile}')
+        print(f'Applying model to {application_file}')
         apply_model_to_data.apply_model_to_site(experiment.model, data_container,\
                                                 [application_file], outfile)
