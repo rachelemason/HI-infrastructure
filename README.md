@@ -4,8 +4,8 @@ This repository contains the python modules and iPython notebooks used to produc
 
 Each notebook calls an associated python module that contains the bulk of the code needed to do the work:
 
-- RunModels.ipynb, run_models.py: train CNNs on LiDAR data and produce initial maps
-- Performance.ipynb, performance.py: train XGBOOST on the initial CNN maps, a canopy height map, and 147 bands of imaging spectroscopy data; produce maps; then use apply vector operations to refine the maps.
+- RunCNN.ipynb, run_cnn.py: train CNNs on LiDAR data and produce initial maps
+- RunXGB.ipynb, run_xgb.py: train XGBOOST on the initial CNN maps, a canopy height map, and 147 bands of imaging spectroscopy data; produce maps; then use apply vector operations to refine the maps.
   - Also calls apply.py to apply models to entire study regions (as opposed to training and test regions)
 - MakeFigures.ipynb, make_figures.py: create the figures in the paper
 
