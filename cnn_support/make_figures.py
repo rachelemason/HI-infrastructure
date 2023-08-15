@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #figure_code.py
-#REM 2022-04-20
+#REM 2022-08-15
 
 """
 Functions for making figures in Mason, Vaughn & Asner (2023)
@@ -467,7 +467,7 @@ def _add_shapley_vals(model_id, wavelengths, ax, label, ptrue=0.01):
             wav = wavelengths[idx]
             xpos = [wav] * shap.shape[0]
             ax.axvline(xpos[0], color='0.9')
-            ax.scatter(xpos, row, s=0.2, c=X_train[:, idx], cmap='cool', zorder=3)
+            ax.scatter(xpos, row, s=0.4, c=X_train[:, idx], cmap='cool', zorder=3)
 
     ax.text(0.02, 0.98, label, ha='left', va='top', transform=ax.transAxes)
     ax.set_xlim(370, 2480)
@@ -508,9 +508,9 @@ def shapley_plot(bnorm_spectra, nonorm_spectra, ptrue=0.01):
     #plot shapley values for model run on brightness-normalized data, in lower subplots
     #do this FIRST so we can get locations of the important features
     features_1 = _add_shapley_vals('run1', wavelengths, ax3, ptrue=ptrue, label='(c)')
-    ax3.text(0.97, 0.95, 'Building class', va='center', ha='right', size=8,\
+    ax3.text(0.97, 0.95, 'Building class', va='center', ha='right', size=10,\
              transform=ax3.transAxes)
-    ax3.text(0.97, 0.05, 'Not-building class', va='center', ha='right', size=8,\
+    ax3.text(0.97, 0.05, 'Not-building class', va='center', ha='right', size=10,\
              transform=ax3.transAxes)
     
     #shapley values for model run on not-normalized data
@@ -519,12 +519,12 @@ def shapley_plot(bnorm_spectra, nonorm_spectra, ptrue=0.01):
     cbaxes = inset_axes(ax4, width="50%", height="6%", loc='lower right') 
     cbar = fig.colorbar(mpl.cm.ScalarMappable(cmap=cmap), cax=cbaxes, ticks=[],\
                         label='', orientation='horizontal')
-    cbar.ax.set_title('Low reflectance            High reflectance', size=8)
+    cbar.ax.set_title('Low refl.                  High refl.', size=10)
 
     #now plot the spectra in the upper subplots
     plotme = _sort_out_stupid_input(bnorm_spectra)
     for id_num, spectrum in plotme.items():
-        ax1.plot(wavelengths, spectrum, color=colors[id_num[0]], zorder=3)
+        ax1.plot(wavelengths, spectrum, color=colors[id_num[0]], zorder=3, lw=2)
         for idx, wav in enumerate(wavelengths):
             if idx in features_1:
                 ax1.axvline(wav, color='0.9')
@@ -540,12 +540,13 @@ def shapley_plot(bnorm_spectra, nonorm_spectra, ptrue=0.01):
         #convert spectra from %*100 to %...
         spectrum = [x * 0.01 for x in spectrum]
         ax2.plot(wavelengths, spectrum, color=colors[id_num[0]], zorder=3,\
-                 label=labels[id_num[0]])
+                 label=labels[id_num[0]], lw=2)
         for idx, wav in enumerate(wavelengths):
             if idx in features_2:
                 ax2.axvline(wav, color='0.9')
     ax2.text(0.02, 0.98, '(b)', ha='left', va='top', transform=ax2.transAxes)
-    ax2.legend(ncol=2, loc='upper right', fontsize=8)
+    ax2.legend(ncol=2, loc='upper right', fontsize=10, handlelength=1.2,\
+               columnspacing=1.4)
     ax2.xaxis.tick_top()
     ax2.xaxis.set_label_position('top')
     ax2.set_xlim(370, 2480)
@@ -558,7 +559,7 @@ def shapley_plot(bnorm_spectra, nonorm_spectra, ptrue=0.01):
     
 def histos():
     """
-    Get png histograms produced by Performance.ipynb and put them into a single figure,
+    Get png histograms produced by RunXGB.ipynb and put them into a single figure,
     for figure 5
     """
     
