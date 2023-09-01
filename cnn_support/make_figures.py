@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #figure_code.py
-#REM 2022-08-15
+#REM 2023-08-31
 
 """
 Functions for making figures in Mason, Vaughn & Asner (2023)
@@ -158,7 +158,7 @@ def _hillshade(img):
 
 def model_progress():
     """
-    This creates Figure 2, which shows the progression of model steps from several 150x150m
+    This creates Figure 3, which shows the progression of model steps from several 150x150m
     regions
     """
     
@@ -494,7 +494,7 @@ def _sort_out_stupid_input(dictos):
 
 def shapley_plot(bnorm_spectra, nonorm_spectra, ptrue=0.01):
     """
-    This makes figure 4.
+    This makes figure 5.
     """
     
     fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 8))
@@ -560,17 +560,17 @@ def shapley_plot(bnorm_spectra, nonorm_spectra, ptrue=0.01):
 def histos():
     """
     Get png histograms produced by RunXGB.ipynb and put them into a single figure,
-    for figure 5
+    for figure 4
     """
     
-    hist1 = img.imread(f'{FIGURE_DATA_PATH}lores_model_hist.png')
+    hist1 = img.imread(f'{FIGURE_DATA_PATH}mean_probability_hist.png')
     hist2 = img.imread(f'{FIGURE_DATA_PATH}gb_ensemble_prob_hist.png')
 
     _, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 8))
     ax1.imshow(hist1)
     ax2.imshow(hist2)
-    ax1.text(0.135, 0.86, '(a)', va='top', ha='left', size=10, transform=ax1.transAxes)
-    ax2.text(0.135, 0.86, '(b)', va='top', ha='left', size=10, transform=ax2.transAxes)
+    ax1.text(0.13, 0.87, '(a)', va='top', ha='left', size=10, transform=ax1.transAxes)
+    ax2.text(0.13, 0.87, '(b)', va='top', ha='left', size=10, transform=ax2.transAxes)
     
     for ax in (ax1, ax2):
         ax.axis('off')

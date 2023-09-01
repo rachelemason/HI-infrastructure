@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 #performance.py
-#REM 2022-04-18
+#REM 2023-09-01
 
 
 """
@@ -12,6 +12,7 @@ import os
 import glob
 import pickle
 import matplotlib.pyplot as plt
+import matplotlib.ticker as tck
 import numpy as np
 import pandas as pd
 import rasterio
@@ -273,6 +274,10 @@ class MapManips(Utils):
                         xdata[n] = np.delete(xdata[n], bad_bands, axis=0)
                         if bnorm:
                             xdata[n] = xdata[n] / linalg.norm(xdata[n], axis=0)
+                elif 'irgb' in data_type:
+                    with rasterio.open(f'{FEATURE_PATH}{data}_{data_type}.tif', 'r') as f:
+                        xdata[n] = f.read()
+                        xdata[n] = np.delete(xdata[n], bad_bands, axis=0)
                 elif 'lores_model' in data_type:
                     with rasterio.open(f'{model_dir}{region}_{data_type}.tif', 'r') as f:
                         xdata[n] = f.read()
@@ -282,7 +287,7 @@ class MapManips(Utils):
                         xdata[n] = f.read()
                         meta = f.meta
 
-                if region == 'HBLower' and data_type != 'tch':
+                if region == 'HBLower': #and data_type != 'tch':
                     xdata[n] = xdata[n][:, :, :-1]
                 if region == 'HBLower' and data_type != 'cnn_model':
                     xdata[n] = xdata[n][:, :-1, :]
@@ -477,6 +482,39 @@ class MapManips(Utils):
             gdf_bounds.to_file(out_file.replace('.tif', '.shp'), driver='ESRI Shapefile')
 
 
+    def vectorize_only(self, map_file, out_file, mask_edges=True):
+        """
+        Vectorize a raster map, but don't do any of the extra operations in
+        self.vectorise_and_clean
+        """
+
+        with rasterio.open(map_file) as f:
+            arr = f.read()
+            meta = f.meta
+
+        #set messed-up edges of regions to NaN, or we may get polygons covering the whole
+        #array when we close holes (don't do this with mosaics)
+        if mask_edges:
+            arr[:, :4, :] = np.nan
+            arr[:, -4:, :] = np.nan
+            arr[:, :, :4] = np.nan
+            arr[:, :, -4:] = np.nan
+
+        polygons = []
+        values = []
+        for vec in rasterio.features.shapes(arr.astype(np.int32), transform=meta['transform']):
+            polygons.append(shape(vec[0]))
+            values.append(vec[1])
+        gdf = gpd.GeoDataFrame(crs=meta['crs'], geometry=polygons)
+
+        gdf['Values'] = values
+
+        #remove polygons composed of NaNs or 0s (building == 1)
+        gdf = gdf[gdf['Values'] > 0]
+        
+        gdf.to_file(out_file, driver='ESRI Shapefile')
+
+
 class Ensemble(MapManips):
     """
     Methods for creating ensemble maps
@@ -539,9 +577,10 @@ class Evaluate(Utils):
     Methods for evaluating model performance and map quality and characteristics
     """
 
-    def __init__(self, model_output_root, training_sets, all_labelled_data):
+    def __init__(self, model_output_root, training_sets, test_sets, all_labelled_data):
         self.model_output_root = model_output_root
         self.training_sets = training_sets
+        self.test_sets = test_sets
         self.all_labelled_data = all_labelled_data
         Utils.__init__(self, all_labelled_data)
 
@@ -555,19 +594,28 @@ class Evaluate(Utils):
 
         counts, _, _ = ax.hist(data[0], bins, histtype='stepfilled', ec='k', fc='0.7',\
                               label='True building')
-        ax.hist(data[1], bins, histtype='step', ec='0.4', label='Not building')
+        counts2, _, _ = ax.hist(data[1], bins, histtype='step', ec='0.4', label='Not building')
+        
         if xlinepos is not None:
             ax.axvline(xlinepos, color='k', ls='--')
         if legend:
-            ax.legend(loc='lower left')
+            ax.legend(loc='upper right', bbox_to_anchor=(0.97, 0.97))
         ax.set_title(title)
         ax.set_xlim(xlims)
         ax.set_xlabel(xtext)
         ax.set_ylim(0, max(counts)*1.05)
         ax.set_ylabel('Frequency')
+        
+        #Dealing with journal's labeling format requirement, will work for labels < 100,000...
+        labels = ax.get_yticks().tolist()
+        labels = [int(s) for s in labels]
+        labels = [str(s)[:2] + ',' + str(s)[2:] if len(str(s)) > 4 else str(s) for s in labels]
+        ax.set_yticklabels(labels)
+
+        return counts, counts2
 
 
-    def probability_hist(self, model_dir, map_type, threshold, title, legend):
+    def probability_hist(self, model_dir, map_type, threshold, title, legend, resolution):
         """
         Produces a histogram of probability values for CNN or GB maps of training+test
         regions. Shows building and not-building pixels, according to the labelled
@@ -581,24 +629,39 @@ class Evaluate(Utils):
 
         #for each test_region map
         for map_file in glob.glob(f'{model_dir}/*{map_type}*'):
-            region = [reg for reg in self.all_labelled_data if reg in map_file][0]
-
-            #quick hack to deal with my stupid filenames
+            try:
+                region = [reg for reg in self.test_sets if reg in map_file][0]
+            except IndexError:
+                #this happens when the map_file list contains CNN maps for whole tiles
+                #(they need to exist for applying the final model to whole tiles)
+                continue
+            
+            #quick hack to deal with my stupid filenames - if the
+            #reion is Hamakua, we don't want to collect data for Hamakua_A
             if 'Hamakua_A' in map_file and 'Hamakua' in region:
                 continue
 
             #open the map and response files
             try:
-                map_arr, ref_arr = self._get_map_and_ref_data(map_file, region, 'lores_')
+                print(f'Working on {region}')
+                map_arr, ref_arr = self._get_map_and_ref_data(map_file, region, resolution)
+
+                if region == 'HBLower' and resolution == 'lores_':
+                    #The ref array doesn't cover all of the HBLower tile so stats will be off
+                    #Could fix that but at this point let's just not use it
+                    print("You should't use HBLower there's an issue with the ref array")
+                    ref_arr = ref_arr[:, :-1]
+                
+                map_arr = map_arr[10:-10, 10:-10]
+                ref_arr = ref_arr[10:-10, 10:-10]
+
             except rasterio.errors.RasterioIOError:
-                #this is KonaMauka and CCTrees
+                #this happens for KonaMauka and CCTrees, lo-res
+                #they don't have any houses so we can just create an all-zero ref array
                 with rasterio.open(map_file, 'r') as f:
                     map_arr = f.read()
                 map_arr = map_arr[0]
                 ref_arr = np.zeros_like(map_arr)
-
-            if region == 'HBLower' and map_type != 'lores_model':
-                ref_arr = ref_arr[:, :-1]
 
             #make arrays of candidates that are and aren't buildings, based on labeled refs
             bldg = np.where((ref_arr == 1), map_arr, -9999)
@@ -610,20 +673,82 @@ class Evaluate(Utils):
         bldg_prob = [x for y in bldg_prob for x in y]
         notbldg_prob = [x for y in notbldg_prob for x in y]
 
-        if map_type == 'lores_model':
-            #this should really be dealt with elsewhere but it's too late to refactor
-            #everything now...
-            bldg_prob = [1 - x for x in bldg_prob]
-            notbldg_prob = [1 - x for x in notbldg_prob]
-
         _, ax = plt.subplots(1, 1, figsize=[6, 6])
         bins = [x * 0.01 for x in range(0, 101, 1)]
-        self._histo(ax, [bldg_prob, notbldg_prob], bins,\
+        bldg_cnts, notbldg_cnts = self._histo(ax, [bldg_prob, notbldg_prob], bins,\
                     'Probability of belonging to building class',\
                     [0, 1], threshold, title, legend)
         plt.savefig(f'/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/for_figures/{map_type}_hist.png',\
                     dpi=450)
+        
+        return bldg_cnts, notbldg_cnts
 
+    
+    @classmethod
+    def cumulative(self, cnn_bldgs, cnn_notbldgs, xgb_bldgs, xgb_notbldgs):
+        """
+        Makes a plot showing cumulative precision and recall for the CNN and
+        XGB models
+        """
+        
+        _, ax = plt.subplots(1, 1, figsize=[6, 6])
+        
+        def recall(counts):
+            #Recall you'd get if you cut at every bin
+            #(bin = building probability threshold)
+
+            #we want to start at 100% and work downwards
+            backwards = list(reversed(counts))
+            selected = np.cumsum(backwards) / np.sum(np.array(backwards))
+            #have to flip again to plot
+            selected = selected[::-1]
+
+            return selected
+        
+        def precision(bldgs, notbldgs):
+            #Precision obtained if you cut at each probability bin
+            #precision = TP / (TP + FP)
+            
+            #Total number of candidates (true + false), cumulatively
+            total_candidates = [x + y for x, y in zip(bldgs, notbldgs)]
+            total_candidates = np.cumsum(list(reversed(total_candidates)))
+            
+            #Cumulative number of true positives
+            true_pos = np.cumsum(list(reversed(bldgs)))
+        
+            prec = true_pos / total_candidates
+            prec = prec[::-1]
+            
+            return prec
+            
+        xpos = [x/100 for x in range(len(cnn_bldgs))]
+            
+        #Recall for CNN
+        selected = recall(cnn_bldgs)
+        ax.plot(xpos, selected, color='0.8', label='Recall; CNN')
+        
+        #Precision for CNN
+        cnn_prec = precision(cnn_bldgs, cnn_notbldgs)
+        ax.plot(xpos, cnn_prec, color='0.8', ls='--', label='Precision; CNN')
+        
+        #Recall for XGB
+        selected = recall(xgb_bldgs)
+        ax.plot(xpos, selected, color='0.2', label='Recall; XGB')
+        
+        #Precision for XGB
+        xgb_prec = precision(xgb_bldgs, xgb_notbldgs)
+        ax.plot(xpos, xgb_prec, color='0.2', ls='--', label='Precision; XGB')
+        
+        ax.legend()
+        
+        ax.set_ylim(0, 1)
+        ax.set_xlim(1, 0)
+        ax.set_xlabel('Probability of belonging to building class')
+        
+        plt.savefig(f'/data/gdcsdata/HawaiiMapping/ProjectFiles/Rachel/for_figures/cumulative.png',\
+                    dpi=450)
+
+        
 
     def get_vars_from_rasters(self, xvars, bad_bands, model_dir, run_id, mask_shade=True,\
                               bnorm=True):
@@ -679,13 +804,19 @@ class Evaluate(Utils):
                     with rasterio.open(f'{RESPONSE_PATH}{data}_lores_responses.tif') as f:
                         arr = f.read()
                         arr = arr[:, 20:-20, 20:-20]
+                elif data_type == 'irgb':
+                    with rasterio.open(f'{FEATURE_PATH}{data}_{data_type}.tif', 'r') as f:
+                        arr = f.read()
+                        arr = arr[:, 20:-20, 20:-20]
+                        #remove the IR band if we are doing RGB only
+                        arr = np.delete(arr, bad_bands, axis=0)
                 else:
-                    raise ValueError('Data types can only include refl|lores_model|tch')
+                    raise ValueError('Data types can only include irgb|refl|lores_model|tch')
 
                 #set pixels with no spectroscopy data to NaN
-                #for some reason HBLower tch and shade mask have 1 fewer row than refl
+                #for some reason some HBLower arrays have 1 fewer row than refl
                 #and model, so we need to do a little reshaping here
-                if region == 'HBLower' and data_type != 'tch':
+                if region == 'HBLower' and data_type == 'reference':
                     arr = arr[:, :, :-1]
 
                 #Get data into 1D so can apply shade mask i.e. remove shaded pixels
